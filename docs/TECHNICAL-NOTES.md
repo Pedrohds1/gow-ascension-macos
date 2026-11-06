@@ -41,7 +41,7 @@ Vulkan/MoltenVK or Metal.
   translated on its own (`lift_edge_frags.py`). Log them with `SPU_LSA_GETLOG` and
   `SPU_INTERP_MISS`.
   - Megaera: 3.5 → 20 fps.
-  - Harem scene: ~3.6 fps → smooth.
+  - Harem scene: ~3.6 → ~30 fps.
 - **NEON beats the generic paths.** Native SPU float under FPCR round-to-zero + flush-to-zero, NEON
   helpers for shuffles, compares and conversions, and a 3-instruction float range check together
   took the Megaera scene from 20 to ~41 fps.

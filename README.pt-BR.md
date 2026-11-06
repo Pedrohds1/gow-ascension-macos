@@ -39,7 +39,7 @@ fps por cena, pelo contador de quadros do próprio jogo, em janelas de 50–90 s
 | Luta com a Megera | ~41 |
 | Ponte / área da prisão | 42–44 |
 | Luta no telhado (a cena mais pesada medida) | 22–27 |
-| Cena da ilusão do harém | ~3,6 → fluida depois de traduzir os fragmentos EDGE que ela usa |
+| Cena da ilusão do harém | ~30 (era ~3,6 antes de traduzir os fragmentos EDGE que ela usa) |
 
 Como a cena da Megera foi de injogável a ~41 fps:
 

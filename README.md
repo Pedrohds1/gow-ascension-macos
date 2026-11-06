@@ -38,7 +38,7 @@ Frame rate by scene (the game's own frame counter, 50–90 s windows):
 | Megaera fight | ~41 |
 | Bridge / prison area | 42–44 |
 | Rooftop fight (heaviest scene measured) | 22–27 |
-| Harem illusion scene | ~3.6 → smooth after translating the EDGE code fragments it uses |
+| Harem illusion scene | ~30 (was ~3.6 before translating the EDGE code fragments it uses) |
 
 How the Megaera scene got from unplayable to ~41 fps:
 
