@@ -1,0 +1,12 @@
+# Nada derivado do jogo entra no repositório / nothing derived from the game goes in the repo
+work/
+build/
+saves/
+*.app
+.venv/
+__pycache__/
+*.iso
+*.elf
+*.self
+EBOOT.*
+.DS_Store

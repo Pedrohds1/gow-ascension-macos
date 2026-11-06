@@ -1,0 +1,20 @@
+#version 450
+// An A8R8G8B8 colour target read as a Y16_X16_FLOAT texture
+// (rsx_vulkan_backend.c, vk_eng_color_to_rg16f): the guest word is the
+// target's A,R,G,B bytes, and the texture decode takes bytes 0-1 and 2-3 as
+// two big-endian halves, so the texel's first half is A<<8|R and its second
+// G<<8|B. In: one RGBA8 texel a word, R in the low byte. Out: one R16G16
+// texel a word, the first half in the low 16 bits.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Texels { uint c[]; };
+layout(std430, binding = 1) writeonly buffer Halves { uint o[]; };
+layout(push_constant) uniform Params { uint n; } pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    uint v = c[i];
+    uint r = v & 255u, g = (v >> 8) & 255u, b = (v >> 16) & 255u, a = v >> 24;
+    o[i] = r | (a << 8) | (b << 16) | (g << 24);
+}

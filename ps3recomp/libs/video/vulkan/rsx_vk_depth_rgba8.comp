@@ -1,0 +1,32 @@
+#version 450
+// A D24S8 depth target as an A8R8G8B8 texture sees it (rsx_vulkan_backend.c,
+// vk_eng_depth_to_argb8): the guest word is the 24-bit depth over the stencil
+// byte, big-endian, so the texel's A,R,G,B are depth bits 23-16, 15-8, 7-0
+// and the stencil. Out: one RGBA8 texel a word, R in the low byte.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Depth { float d[]; };
+layout(std430, binding = 1) readonly buffer Stencil { uint s[]; };
+layout(std430, binding = 2) writeonly buffer Texels { uint o[]; };
+layout(push_constant) uniform Params { uint n; uint has_stencil; } pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float x = d[i];
+    if (!(x > 0.0)) x = 0.0;
+    if (x > 1.0) x = 1.0;
+    // round(x * (2^24 - 1)) as the engine's guest store does in double:
+    // x * 2^24 is exact, so x * (2^24 - 1) = u + (f - x) with u its integer
+    // part and f its fraction, and only f - x (both below 1) is rounded.
+    // `precise`: a driver that reassociates this (seen: NVIDIA) turns depth
+    // 1.0 into 0x1000000.
+    precise float hi = x * 16777216.0;
+    precise float fl = floor(hi);
+    precise float f = hi - fl;
+    precise float r = (f - x) + 0.5;
+    uint v = uint(int(fl) + int(floor(r)));
+    v = min(v, 16777215u);
+    uint st = pc.has_stencil != 0u ? (s[i >> 2] >> ((i & 3u) * 8u)) & 255u : 0u;
+    o[i] = ((v >> 8) & 255u) | ((v & 255u) << 8) | (st << 16) | (((v >> 16) & 255u) << 24);
+}

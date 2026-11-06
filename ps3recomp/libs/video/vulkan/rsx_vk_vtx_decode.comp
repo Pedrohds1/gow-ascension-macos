@@ -1,0 +1,57 @@
+#version 450
+// Guest vertex attributes decoded on the GPU into the engine's host layout
+// (rsx_vulkan_backend.c, VK_ENG_VTX_GPU): one float4 per selected attribute
+// per vertex. A draw's header in the raw ring holds the vertex count, the
+// slot count, where its vertices go in the vertex ring and how far apart,
+// then per slot the guest bytes' offset in the raw ring, their stride, the
+// RSX vertex type, the component count and the default value. Every result
+// is the bit pattern rsx_vertex_fetch_many writes: floats pass through as
+// bits, and the formats the CPU decodes with a division or the half rules
+// come from tables the CPU filled with its own decode.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Raw { uint raw[]; };
+layout(std430, binding = 1) writeonly buffer Out { uint o[]; };
+layout(std430, binding = 2) readonly buffer Tab { uint tab[]; };   // [0,256) unorm8, [256,65792) snorm16, [65792,131328) half
+layout(push_constant) uniform Params { uint hdr; } pc;
+
+uint rb(uint a) { return (raw[a >> 2] >> ((a & 3u) * 8u)) & 255u; }
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint h = pc.hdr;
+    uint count = raw[h], nslots = raw[h + 1u];
+    if (gid >= count * nslots) return;
+    uint v = gid / nslots, s = gid - v * nslots;
+    uint d = h + 4u + s * 8u;
+    uint off = raw[d], stride = raw[d + 1u], type = raw[d + 2u], n = raw[d + 3u];
+    uint dst = raw[h + 2u] + v * raw[h + 3u] + s * 4u;
+    if (type == 0u) {
+        o[dst] = raw[d + 4u]; o[dst + 1u] = raw[d + 5u]; o[dst + 2u] = raw[d + 6u]; o[dst + 3u] = raw[d + 7u];
+        return;
+    }
+    uint a = off + v * stride;
+    uint r[4] = uint[4](0u, 0u, 0u, 0x3F800000u);
+    for (uint c = 0u; c < n; c++) {
+        uint x;
+        if (type == 2u) {                       // FLOAT: big-endian bits
+            uint b = a + c * 4u;
+            x = (rb(b) << 24) | (rb(b + 1u) << 16) | (rb(b + 2u) << 8) | rb(b + 3u);
+        } else if (type == 3u) {                // HALF
+            uint b = a + c * 2u;
+            x = tab[65792u + ((rb(b) << 8) | rb(b + 1u))];
+        } else if (type == 4u) {                // UNORM8
+            x = tab[rb(a + c)];
+        } else if (type == 7u) {                // UINT8
+            x = floatBitsToUint(float(rb(a + c)));
+        } else if (type == 1u) {                // SNORM16
+            uint b = a + c * 2u;
+            x = tab[256u + ((rb(b) << 8) | rb(b + 1u))];
+        } else {                                // SINT16
+            uint b = a + c * 2u;
+            x = floatBitsToUint(float(int(((rb(b) << 8) | rb(b + 1u)) << 16) >> 16));
+        }
+        r[c] = x;
+    }
+    o[dst] = r[0]; o[dst + 1u] = r[1]; o[dst + 2u] = r[2]; o[dst + 3u] = r[3];
+}
