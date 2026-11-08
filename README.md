@@ -29,19 +29,30 @@ All numbers below were measured on this machine, on mains power.
 
 ## Performance
 
-Frame rate by scene (the game's own frame counter, 50–90 s windows):
+Frame rate by scene with build v20 (2026-11-08): the game's own frame counter over a fixed ~75 s
+window of each scene, measured headless from a save.
 
-| Scene | fps |
+| Scene | fps (v20) | Earlier |
+|---|---|---|
+| Main menu | 60 (locked; not re-measured) | 60 (locked); ~74 uncapped |
+| Opening of the first level | **~69** | 46–54 |
+| Megaera fight | **~60** (59.9 in A/B; 61.1 in its steady part; 59.7 over 10 minutes) | ~41 |
+| Bridge / prison area | **~63** | 42–44 |
+| Rooftop fight (heaviest scene measured) | **~33** | 22–27 |
+| Harem illusion scene | ~30 (earlier build; not re-measured) | ~3.6 before translating the EDGE code fragments it uses |
+
+- Values above 60 are real: the port does not cap the frame rate at 60 in these scenes.
+- The harem scene needs someone to play up to it: a headless run resumes at the save's last
+  checkpoint, which is the bridge.
+
+Captures from those runs. The game has no on-screen counter: the number is drawn on the frame from
+the game's own frame counter, averaged over the 10 s around it (`scripts/print_fps.py`).
+
+| Opening of the first level | Megaera fight |
 |---|---|
-| Main menu | 60 (locked); ~74 uncapped |
-| Start of the first level | 46–54 |
-| Megaera fight | **~60** (59.9 in A/B; 61.1 in its steady part; 59.7 over 10 minutes) |
-| Bridge / prison area | 42–44 |
-| Rooftop fight (heaviest scene measured) | 22–27 |
-| Harem illusion scene | ~30 (was ~3.6 before translating the EDGE code fragments it uses) |
-
-The Megaera fight was re-measured on 2026-11-08 (fixed window of the fight, headless, interleaved
-A/B). The other scenes are from earlier builds; they have not been re-measured since the work below.
+| ![Opening of the first level, 68.6 fps](docs/img/fps-level-opening.jpg) | ![Megaera fight, 60.8 fps](docs/img/fps-megaera.jpg) |
+| **Bridge / prison area** | **Rooftop fight** |
+| ![Bridge / prison area, 64.3 fps](docs/img/fps-bridge.jpg) | ![Rooftop fight, 33.3 fps](docs/img/fps-rooftop.jpg) |
 
 How the Megaera scene got from unplayable to ~60 fps:
 

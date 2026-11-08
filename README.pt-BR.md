@@ -30,20 +30,30 @@ Todos os números abaixo foram medidos nesta máquina, na tomada.
 
 ## Desempenho
 
-fps por cena, pelo contador de quadros do próprio jogo, em janelas de 50–90 s:
+fps por cena com o build v20 (08/11/2026): o contador de quadros do próprio jogo numa janela fixa
+de ~75 s de cada cena, medido sem janela a partir de um save.
 
-| Cena | fps |
+| Cena | fps (v20) | Antes |
+|---|---|---|
+| Menu principal | 60 (travado; não medido de novo) | 60 (travado); ~74 destravado |
+| Abertura do primeiro nível | **~69** | 46–54 |
+| Luta com a Megera | **~60** (59,9 no A/B; 61,1 no trecho estável; 59,7 em 10 minutos) | ~41 |
+| Ponte / área da prisão | **~63** | 42–44 |
+| Luta no telhado (a cena mais pesada medida) | **~33** | 22–27 |
+| Cena da ilusão do harém | ~30 (build anterior; não medida de novo) | ~3,6 antes de traduzir os fragmentos EDGE que ela usa |
+
+- Valores acima de 60 são reais: o port não trava o fps em 60 nessas cenas.
+- A cena do harém exige alguém jogando até ela: o teste sem janela retoma no último checkpoint do
+  save, que é a ponte.
+
+Capturas dessas medições. O jogo não tem contador na tela: o número é desenhado sobre o quadro a
+partir do contador de quadros do próprio jogo, pela média dos 10 s em volta (`scripts/print_fps.py`).
+
+| Abertura do primeiro nível | Luta com a Megera |
 |---|---|
-| Menu principal | 60 (travado); ~74 destravado |
-| Início do primeiro nível | 46–54 |
-| Luta com a Megera | **~60** (59,9 no A/B; 61,1 no trecho estável; 59,7 em 10 minutos) |
-| Ponte / área da prisão | 42–44 |
-| Luta no telhado (a cena mais pesada medida) | 22–27 |
-| Cena da ilusão do harém | ~30 (era ~3,6 antes de traduzir os fragmentos EDGE que ela usa) |
-
-A luta com a Megera foi medida de novo em 08/11/2026 (janela fixa da luta, sem janela, A/B
-intercalado). As outras cenas são de builds anteriores e ainda não foram medidas depois do
-trabalho abaixo.
+| ![Abertura do primeiro nível, 68,6 fps](docs/img/fps-level-opening.jpg) | ![Luta com a Megera, 60,8 fps](docs/img/fps-megaera.jpg) |
+| **Ponte / área da prisão** | **Luta no telhado** |
+| ![Ponte / área da prisão, 64,3 fps](docs/img/fps-bridge.jpg) | ![Luta no telhado, 33,3 fps](docs/img/fps-rooftop.jpg) |
 
 Como a cena da Megera foi de injogável a ~60 fps:
 
