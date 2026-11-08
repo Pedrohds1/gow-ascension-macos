@@ -819,7 +819,13 @@ static mfc_engine* mfc_for(spu_context* ctx)
      * its stopped owner releases it); any other free invalidates the cache. */
     /* One record, one TLS lookup: on macOS each separate thread-local is a _tlv_get_addr call. */
     static SPU_THREAD_LOCAL struct { spu_context* ctx; spu_mfc_slot* slot; long gen; } t_mc;
-    if (t_mc.slot && t_mc.ctx == ctx && t_mc.gen == s_mfc_free_gen)
+    /* Slots are never freed (a released one is marked free and reused), so the
+     * cached node is always readable, and it is this context's while its owner
+     * field still says so. A global "something was freed" generation used to
+     * void every thread's cache on each transient job/task context's exit, and
+     * the misses queued on the claim lock (a pthread_rwlock on the Mac). */
+    if (t_mc.slot && t_mc.ctx == ctx &&
+        __atomic_load_n(&t_mc.slot->ctx, __ATOMIC_ACQUIRE) == ctx)
         return &t_mc.slot->mfc;
 
     AcquireSRWLockShared(&s_mfc_claim_lock);
@@ -843,16 +849,26 @@ static mfc_engine* mfc_for(spu_context* ctx)
             return &slot->mfc;
         }
     }
-    spu_mfc_slot* slot = (spu_mfc_slot*)malloc(sizeof(*slot));
-    if (!slot) {
-        fprintf(stderr, "[SPU] cannot allocate private MFC engine for context %p\n", (void*)ctx);
-        fflush(stderr);
-        abort(); /* Shared fallback state would silently corrupt DMA completion. */
+    /* Reuse a released slot before allocating one. The engine is initialised
+     * before the owner is published, so a cache that matches sees it whole. */
+    spu_mfc_slot* slot = NULL;
+    for (spu_mfc_slot* s = s_mfc_slots; s; s = s->next)
+        if (!__atomic_load_n(&s->ctx, __ATOMIC_ACQUIRE)) { slot = s; break; }
+    if (slot) {
+        mfc_engine_init(&slot->mfc);
+        __atomic_store_n(&slot->ctx, ctx, __ATOMIC_RELEASE);
+    } else {
+        slot = (spu_mfc_slot*)malloc(sizeof(*slot));
+        if (!slot) {
+            fprintf(stderr, "[SPU] cannot allocate private MFC engine for context %p\n", (void*)ctx);
+            fflush(stderr);
+            abort(); /* Shared fallback state would silently corrupt DMA completion. */
+        }
+        mfc_engine_init(&slot->mfc);
+        __atomic_store_n(&slot->ctx, ctx, __ATOMIC_RELEASE);
+        slot->next = s_mfc_slots;
+        s_mfc_slots = slot;
     }
-    slot->ctx = ctx;
-    mfc_engine_init(&slot->mfc);
-    slot->next = s_mfc_slots;
-    s_mfc_slots = slot;
     t_mc.ctx = ctx; t_mc.slot = slot; t_mc.gen = s_mfc_free_gen;
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
     return &slot->mfc;
@@ -861,13 +877,11 @@ static mfc_engine* mfc_for(spu_context* ctx)
 void spu_mfc_release(spu_context* ctx)
 {
     if (!ctx) return;
+    /* Mark the slot free; it stays in the list for the next context (see mfc_for). */
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (spu_mfc_slot** link = &s_mfc_slots; *link; link = &(*link)->next) {
-        if ((*link)->ctx != ctx) continue;
-        spu_mfc_slot* slot = *link;
-        *link = slot->next;
-        s_mfc_free_gen++;
-        free(slot);
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
+        if (slot->ctx != ctx) continue;
+        __atomic_store_n(&slot->ctx, (spu_context*)NULL, __ATOMIC_RELEASE);
         break;
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
@@ -888,16 +902,10 @@ void spu_jobcap_mfc_state(spu_context* ctx, uint32_t* tag_completed,
 void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
 {
     AcquireSRWLockExclusive(&s_mfc_claim_lock);
-    for (spu_mfc_slot** link = &s_mfc_slots; *link;) {
-        spu_mfc_slot* slot = *link;
+    for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
         uintptr_t owner = (uintptr_t)slot->ctx;
-        if (owner >= lo && owner < hi) {
-            *link = slot->next;
-            s_mfc_free_gen++;
-            free(slot);
-        } else {
-            link = &slot->next;
-        }
+        if (owner && owner >= lo && owner < hi)
+            __atomic_store_n(&slot->ctx, (spu_context*)NULL, __ATOMIC_RELEASE);
     }
     ReleaseSRWLockExclusive(&s_mfc_claim_lock);
 }
@@ -1127,7 +1135,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * spu_coh_reserve_fast). Anything else takes the lock as before. */
         const int llar_fast = spu_coh_reserve_fast(ctx, ea);
         if (!llar_fast) {
-            spu_lockline_lock();
+            spu_lockline_lock_line(ea);   /* this line's stripe (SPU_LOCKLINE_STRIPES) */
             /* Tell the PPU store paths this line is live, so a store into it goes
              * through the lock and raises SPU_EVENT_LR here instead of landing
              * unannounced. Nothing else about this transaction changes. */
@@ -1171,6 +1179,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (!llar_fast) {
             ctx->resv_ea = ea;
             __atomic_store_n(&ctx->resv_valid, (int)((ea & ~127u) | 1u), __ATOMIC_RELAXED);
+            spu_coh_mirror_set(ctx, ea);               /* still under the lock-line lock */
         }   /* the fast path published it already */
         ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
@@ -1202,7 +1211,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                                 ctx->gpr[g]._u32[0], ctx->gpr[g]._u32[1], ctx->gpr[g]._u32[2], ctx->gpr[g]._u32[3], 10);
                 } }
           } }
-        if (!llar_fast) spu_lockline_unlock();
+        if (!llar_fast) spu_lockline_unlock_line(ea);
         /* `ls` is this SPU's own copy, so recording it outside the lock is the
          * line exactly as the GETLLAR read it. */
         if (g_spu_jobcap_on > 0 && t_jc.ctx == ctx)
@@ -1269,7 +1278,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         { extern uint32_t g_barrier_sync_watch;
           uint32_t b = g_barrier_sync_watch;
           if (b && (ea & ~127u) == (b & ~127u)) g_spu_putllc_sync_hit++; }
-        spu_lockline_lock();
+        spu_lockline_lock_line(ea);
         if (ctx->resv_valid && ctx->resv_ea == ea &&
             memcmp(mem, ctx->resv_line, MFC_ATOMIC_LINE) == 0) {
             { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
@@ -1361,7 +1370,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->atomic_stat ? "FAIL" : "OK",
                       ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
         ctx->resv_valid = 0;                           /* reservation consumed */
-        spu_lockline_unlock();
+        spu_coh_mirror_clear(ctx);
+        spu_lockline_unlock_line(ea);
         if (g_spu_jobcap_on > 0 && t_jc.ctx == ctx)
             jc_ev(JC_PUTLLC, cmd, ea, lsa, ctx->atomic_stat == 0, ls, MFC_ATOMIC_LINE);
         if (ctx->atomic_stat == 0) {
@@ -1373,7 +1383,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 
     case MFC_PUTLLUC_CMD:
     case MFC_PUTQLLUC_CMD:
-        spu_lockline_lock();
+        spu_lockline_lock_line(ea);
         { extern void spu_lockguard_check(spu_context*, uint32_t, const uint8_t*, uint32_t, const char*);
           spu_lockguard_check(ctx, ea, ls, MFC_ATOMIC_LINE, "PUTLLUC"); }
         memcpy(mem, ls, MFC_ATOMIC_LINE);              /* unconditional store */
@@ -1384,7 +1394,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * has already overwritten. */
         spu_coh_notify_write(ea);
         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
-        spu_lockline_unlock();
+        spu_coh_mirror_clear(ctx);
+        spu_lockline_unlock_line(ea);
         if (g_spu_jobcap_on > 0 && t_jc.ctx == ctx)
             jc_ev(JC_PUTLLUC, cmd, ea, lsa, 1, ls, MFC_ATOMIC_LINE);
         spu_taskset_line_committed(ea & ~127u);
@@ -1566,8 +1577,14 @@ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
          * write the stale value back. The edge is then gone, and an SPU that
          * has just acknowledged the events it read goes back to sleep believing
          * it still holds a reservation it has already lost, which is the parked
-         * SPURS kernel this whole mechanism exists to wake. */
-        spu_lockline_lock();
+         * SPURS kernel this whole mechanism exists to wake.
+         * SPU_EVENT_SET/CLEAR are atomic read-modify-writes now, so that race
+         * is closed by the atomics; striped (SPU_LOCKLINE_STRIPES), taking
+         * every stripe on every acknowledge would serialize all SPUs again,
+         * and the list-stall state below is this SPU's own. One stripe: the
+         * lock, as before. */
+        { const int ack_lock = !spu_lockline_striped();
+        if (ack_lock) spu_lockline_lock();
         SPU_EVENT_CLEAR(ctx, v);
         /* A stall-and-notify nobody has read yet stays pending. We run a
          * resumed list inline, inside the MFC_WrListStallAck that resumes it,
@@ -1577,7 +1594,7 @@ static void spu_wrch_impl(spu_context* ctx, uint32_t channel, u128 value)
          * (list_stall_stat set, Sn clear). */
         if ((v & 0x2u) && ctx->list_stall_stat)
             SPU_EVENT_SET(ctx, 0x2u);
-        spu_lockline_unlock();
+        if (ack_lock) spu_lockline_unlock(); }
         break;
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
@@ -1637,6 +1654,7 @@ static void spu_resv_lost_poll(spu_context* ctx)
     if (!vm_base || ctx->resv_ea == 0) return;
     if (memcmp(vm_base + ctx->resv_ea, ctx->resv_line, 128) != 0) {
         ctx->resv_valid = 0;
+        spu_coh_mirror_clear(ctx);
         SPU_EVENT_SET(ctx, 0x400u);
     }
 }
@@ -2278,6 +2296,8 @@ int spu_have_function(uint32_t addr)
  * (spu_interp.c, rejoin path). It IS the registry lookup, so overlay eviction and
  * self-modifying-code invalidation are honored automatically. Lived in
  * spu_fn_registry.c before the registry was consolidated into this TU. */
+static inline int spu_reloc_slot_live(const spu_context* ctx, unsigned slot, uint32_t lsa);   /* below */
+static inline void spu_reloc_slot_drop(spu_context* ctx, unsigned slot);
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
     if (!ctx) return (spu_lifted_fn)spu_lookup(lsa, 0);
@@ -2291,6 +2311,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
             lsa - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
             const uint32_t canon = ctx->resident_code[slot].canon;
             if (!canon) return (spu_lifted_fn)spu_lookup(lsa, ctx->resident_code[slot].image_id);
+            if (!spu_reloc_slot_live(ctx, slot, lsa)) { spu_reloc_slot_drop((spu_context*)ctx, slot); continue; }
             /* Relocatable code: the caller runs the function next, so set its delta now. */
             spu_fn f = spu_lookup(lsa - ctx->resident_code[slot].lsa + canon, ctx->resident_code[slot].image_id);
             if (f) ((spu_context*)ctx)->reloc_delta = (int32_t)(ctx->resident_code[slot].lsa - canon);
@@ -2323,6 +2344,20 @@ static int s_ovl_head[SPU_OVL_HASH];
 static int s_ovl_next[SPU_OVL_SRC_MAX];
 static int s_ovl_sig[SPU_OVL_SRC_MAX];
 static int s_ovl_sig_count = 0;
+/* The signature list again, chained by a hash of each signature's first 8
+ * bytes in registration order: a GET of >= 512 bytes used to memcmp its head
+ * against every signature (~95 in GoW:A, ~1.8% of an EDGE thread); now only
+ * against those whose first 8 bytes hash alike, first registered first, which
+ * is the same first match the list gives. Chains hold k+1 (k: index into
+ * s_ovl_sig), 0 ends. */
+#define SPU_OVL_SIGH 256u
+static int s_ovl_sig_head[SPU_OVL_SIGH], s_ovl_sig_tail[SPU_OVL_SIGH];
+static int s_ovl_sig_next[SPU_OVL_SRC_MAX];
+static inline unsigned spu_ovl_sig_hash(const uint8_t* p)
+{
+    uint64_t v; memcpy(&v, p, 8);
+    return (unsigned)((v * 0x9E3779B97F4A7C15ull) >> 56);
+}
 static inline unsigned spu_ovl_hash(uint32_t ea) { return ((ea >> 4) ^ (ea >> 16)) & (SPU_OVL_HASH - 1u); }
 
 void spu_overlay_register_source(uint32_t content_ea, int image_id)
@@ -2366,13 +2401,130 @@ void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t 
  * content at any address makes that copy resident; dispatch then looks the function up at
  * canon + offset and sets ctx->reloc_delta, which the lifted code adds to every address
  * it derives from its own pc. */
+#define SPU_RELOC_MAX 16
+#define SPU_RELOC_COPIES 4
+static struct { int src; uint32_t n; uint64_t* key; } s_reloc[SPU_RELOC_MAX];   /* key: word << 32 | offset, sorted */
+static int s_reloc_n;
+static int spu_reloc_cmp(const void* x, const void* y)
+{
+    const uint64_t a = *(const uint64_t*)x, b = *(const uint64_t*)y;
+    return a < b ? -1 : a > b;
+}
 void spu_overlay_register_region_reloc(uint32_t content_ea, uint32_t span, uint32_t canon, int image_id)
 {
     if (!canon || canon + span > SPU_LS_SIZE) return;
     { static int s_off = -1; if (s_off < 0) { const char* e = getenv("SPU_RELOC_OFF"); s_off = e && e[0] == '1'; }
       if (s_off) return; }   /* SPU_RELOC_OFF=1: leave that code to the interpreter (A/B) */
     spu_overlay_register_region(content_ea, span, image_id);
-    if (s_ovl_src[s_ovl_src_count - 1].image_id == image_id) s_ovl_src[s_ovl_src_count - 1].canon = canon;
+    if (s_ovl_src[s_ovl_src_count - 1].image_id == image_id) {
+        s_ovl_src[s_ovl_src_count - 1].canon = canon;
+        if (s_reloc_n < SPU_RELOC_MAX) s_reloc[s_reloc_n++].src = s_ovl_src_count - 1;
+    }
+}
+
+/* Relocatable code at a placement no GET made resident. GoW:A's BatchJobList keeps
+ * several copies of one blob in local store at once (6d66b0 at two addresses, 6af1b0
+ * at three), and a GET kept one placement per image resident: a branch into another
+ * copy ran in the interpreter (~2 s of every 20 at 0x359C0, a third of a thread in
+ * the Megera fight). On a dispatch miss the word at pc is looked up in each region's
+ * index (built once, from the source bytes in guest memory: the EBOOT is not loaded
+ * when the regions register), each candidate placement -- 16-byte aligned, as the DMA
+ * lands it -- is checked against the whole region, and a match is made resident.
+ * SPU_RELOC_RECOVER=0 turns it off. */
+static int spu_reloc_index_build(void)
+{
+    static volatile LONG s_state;   /* 0 not built, 1 building, 2 built */
+    if (s_state == 2) return 1;
+    if (InterlockedCompareExchange(&s_state, 1, 0) != 0) {
+        while (s_state != 2) YieldProcessor();
+        return 1;
+    }
+    for (int r = 0; r < s_reloc_n; r++) {
+        const spu_ovl_src* o = &s_ovl_src[s_reloc[r].src];
+        const uint32_t n = o->span / 4;
+        uint64_t* k = (uint64_t*)malloc((size_t)n * sizeof *k);
+        if (!k) continue;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t w; memcpy(&w, vm_base + o->src_ea + 4 * i, 4);
+            k[i] = ((uint64_t)w << 32) | (4 * i);
+        }
+        qsort(k, n, sizeof *k, spu_reloc_cmp);
+        s_reloc[r].key = k; s_reloc[r].n = n;
+    }
+    __atomic_store_n(&s_state, 2, __ATOMIC_RELEASE);
+    return 1;
+}
+/* Make [base, base + span) of region o resident: the slot already at base, else a free
+ * one, else (or once the image already holds SPU_RELOC_COPIES slots) one of its own
+ * other copies. Returns the slot, or -1. */
+static int spu_reloc_place(spu_context* ctx, const spu_ovl_src* o, uint32_t base, uint32_t src_ea)
+{
+    int same = -1, free_ = -1, own = -1; unsigned copies = 0;
+    for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; s++) {
+        const int id = ctx->resident_code[s].image_id;
+        if (id && ctx->resident_code[s].lsa == base) { same = (int)s; break; }
+        if (!id) { if (free_ < 0) free_ = (int)s; continue; }
+        if (o->canon && id == o->image_id) { copies++; if (own < 0) own = (int)s; }
+    }
+    int slot = same >= 0 ? same : (copies >= SPU_RELOC_COPIES && own >= 0) ? own : free_ >= 0 ? free_ : own;
+    if (slot < 0) return -1;
+    ctx->resident_code[slot].lsa = base;
+    ctx->resident_code[slot].size = o->span;
+    ctx->resident_code[slot].source_ea = src_ea;
+    ctx->resident_code[slot].image_id = o->image_id;
+    ctx->resident_code[slot].canon = o->canon;
+    if (o->image_id) ctx->resident_code_mask |= 1u << slot;
+    else ctx->resident_code_mask &= ~(1u << slot);
+    return slot;
+}
+static int spu_reloc_recover(spu_context* ctx)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("SPU_RELOC_RECOVER"); s_on = !(e && e[0] == '0'); }
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
+    if (!s_on || !s_reloc_n || !vm_base || pc < 0x4000) return 0;
+    spu_reloc_index_build();
+    uint32_t w; memcpy(&w, ctx->ls + pc, 4);
+    const uint64_t lo = (uint64_t)w << 32;
+    for (int r = 0; r < s_reloc_n; r++) {
+        const uint64_t* k = s_reloc[r].key; const uint32_t n = s_reloc[r].n;
+        if (!k) continue;
+        uint32_t a = 0, b = n;               /* first key >= lo */
+        while (a < b) { const uint32_t m = (a + b) / 2; if (k[m] < lo) a = m + 1; else b = m; }
+        const spu_ovl_src* o = &s_ovl_src[s_reloc[r].src];
+        for (; a < n && (k[a] >> 32) == w; a++) {
+            const uint32_t f = (uint32_t)k[a];
+            if (((f ^ pc) & 15u) || f > pc) continue;
+            const uint32_t base = pc - f;
+            if (base + o->span > SPU_LS_SIZE) continue;
+            /* the whole region but its last quadword: a registered span may round past
+             * what the GET copies */
+            const uint32_t cmp = o->span > 16 ? o->span - 16 : o->span;
+            if (memcmp(ctx->ls + base, vm_base + o->src_ea, cmp) != 0) continue;
+            if (spu_reloc_place(ctx, o, base, o->src_ea) < 0) return 0;
+            static volatile LONG s_n;
+            const LONG c = InterlockedIncrement(&s_n);
+            if (c <= 8 || (c & (c - 1)) == 0)
+                fprintf(stderr, "[spu-reloc] recovered #%ld: img=%d placement 0x%05X (pc 0x%05X) by content, ctx img=%d\n",
+                        (long)c, o->image_id, base, pc, ctx->image_id);
+            return 1;
+        }
+    }
+    return 0;
+}
+/* A relocatable slot still holds its blob at lsa: the 8 bytes there match the source
+ * (local-store stores can replace code no GET reported). */
+static inline int spu_reloc_slot_live(const spu_context* ctx, unsigned slot, uint32_t lsa)
+{
+    lsa &= SPU_LS_MASK;
+    const uint32_t off = lsa - ctx->resident_code[slot].lsa;
+    if (!vm_base || lsa + 8 > SPU_LS_SIZE || off + 8 > ctx->resident_code[slot].size) return 1;
+    return memcmp(ctx->ls + lsa, vm_base + ctx->resident_code[slot].source_ea + off, 8) == 0;
+}
+static inline void spu_reloc_slot_drop(spu_context* ctx, unsigned slot)
+{
+    ctx->resident_code[slot].image_id = 0;
+    ctx->resident_code_mask &= ~(1u << slot);
 }
 
 /* Register one-way runtime entries that replace the guest call stack.
@@ -2471,6 +2623,11 @@ void spu_overlay_register_sig(const uint8_t sig[16], int image_id)
         s_ovl_src[s_ovl_src_count].image_id = image_id;
         memcpy(s_ovl_src[s_ovl_src_count].sig, sig, 16);
         s_ovl_src[s_ovl_src_count].has_sig = 1;
+        { const int k = s_ovl_sig_count; const unsigned h = spu_ovl_sig_hash(sig);
+          s_ovl_sig_next[k] = 0;
+          if (s_ovl_sig_tail[h]) s_ovl_sig_next[s_ovl_sig_tail[h] - 1] = k + 1;
+          else s_ovl_sig_head[h] = k + 1;
+          s_ovl_sig_tail[h] = k + 1; }
         s_ovl_sig[s_ovl_sig_count++] = s_ovl_src_count;
         s_ovl_src_count++;
     }
@@ -2568,9 +2725,9 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
     }
     /* The first registered entry that matches wins, as in a scan in order. */
     int best = -1;
-    if (size >= 512)
-        for (int k = 0; k < s_ovl_sig_count; k++)
-            if (memcmp(ls, s_ovl_src[s_ovl_sig[k]].sig, 16) == 0) { best = s_ovl_sig[k]; break; }
+    if (size >= 512 && s_ovl_sig_count)
+        for (int j = s_ovl_sig_head[spu_ovl_sig_hash(ls)]; j; j = s_ovl_sig_next[j - 1])
+            if (memcmp(ls, s_ovl_src[s_ovl_sig[j - 1]].sig, 16) == 0) { best = s_ovl_sig[j - 1]; break; }
     for (int j = s_ovl_head[spu_ovl_hash(ea)]; j; j = s_ovl_next[j - 1]) {
         const spu_ovl_src* o = &s_ovl_src[j - 1];
         if (!o->has_sig && o->src_ea == ea && (!o->lsa || o->lsa == lsa) && (best < 0 || j - 1 < best))
@@ -2581,22 +2738,13 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
         {
             if (o->span) {
                 if (lsa + o->span > SPU_LS_SIZE) return;
-                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
-                    /* A relocatable image takes over its own previous placement's slot: each load
-                     * lands somewhere new, and stale copies would fill the slots. */
-                    if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa &&
-                        !(o->canon && ctx->resident_code[slot].image_id == o->image_id))
-                        continue;
-                    ctx->resident_code[slot].lsa = lsa;
-                    ctx->resident_code[slot].size = o->span;
-                    ctx->resident_code[slot].source_ea = ea;
-                    ctx->resident_code[slot].image_id = o->image_id;
-                    ctx->resident_code[slot].canon = o->canon;
-                    if (o->image_id) ctx->resident_code_mask |= 1u << slot;
-                    else ctx->resident_code_mask &= ~(1u << slot);
-                    return;
-                }
-                fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
+                /* The slot at this address, else a free one; a relocatable image keeps up to
+                 * SPU_RELOC_COPIES placements resident (the title holds several copies at once)
+                 * and past that takes over one of its own, so stale copies cannot fill the
+                 * slots. It used to take over its previous placement at once, and a branch
+                 * into the other copy ran in the interpreter. */
+                if (spu_reloc_place(ctx, o, lsa, ea) < 0)
+                    fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", o->image_id);
                 return;
             }
             if (ctx->resident_ovl != o->image_id) {
@@ -3029,6 +3177,23 @@ static int spu_smc_microstep(spu_context* ctx)
                 }
             }
             const int wid = ctx->policy_mode ? ctx->ls[0x1DF] : -1;
+            /* SPU_INTERP_DUMPAT=<img>:<hex pc>[,<file>]: the first time the interpreter
+             * starts at that (image, key), write the whole local store and the
+             * registers to <file> (default spu_interp_dump.bin): what the code there is
+             * and where it came from (copied from the EBOOT or generated). */
+            { static int s_da = -1; static uint32_t s_dpc; static char s_df[512];
+              if (s_da == -1) { const char* e = getenv("SPU_INTERP_DUMPAT"); s_da = -2;
+                  if (e) { char* q; s_da = (int)strtol(e, &q, 10);
+                           if (*q == ':') s_dpc = (uint32_t)strtoul(q + 1, &q, 16);
+                           snprintf(s_df, sizeof s_df, "%s", *q == ',' ? q + 1 : "spu_interp_dump.bin"); } }
+              static volatile LONG s_done;
+              if (s_da >= 0 && im == s_da && key == s_dpc && !s_done &&
+                  InterlockedCompareExchange(&s_done, 1, 0) == 0) {
+                  FILE* f = fopen(s_df, "wb");
+                  if (f) { fwrite(ctx->ls, 1, SPU_LS_SIZE, f); fwrite(ctx->gpr, 16, 128, f); fclose(f); }
+                  fprintf(stderr, "[interp-dump] img=%d key=0x%05X pc=0x%05X wid=%d lr=0x%05X -> %s\n",
+                          im, key, pc_entry, wid, ctx->gpr[0]._u32[0] & SPU_LS_MASK, s_df);
+                  fflush(stderr); } }
             AcquireSRWLockExclusive(&ml);
             unsigned h = (key * 2654435761u ^ (unsigned)im * 40503u ^ (unsigned)(wid + 1) * 977u) % NM;
             for (unsigned q = 0; q < NM; q++, h = (h + 1) % NM) {
@@ -3245,7 +3410,20 @@ static __attribute__((noinline)) void spu_unlifted_branch_report(const spu_conte
  * entry or task ELF -- bumps s_ibc_epoch, which empties the table. PS3_SPU_IBC=0 turns it off, as does
  * any trace switch spu_indirect_branch reads. */
 enum { IBC_SIZE = 512 };
-static SPU_THREAD_LOCAL struct { uint32_t gen; struct { uint64_t key; spu_fn fn; } e[IBC_SIZE]; } t_ibcs;
+typedef struct { uint32_t gen; struct { uint64_t key; spu_fn fn; } e[IBC_SIZE]; } spu_ibc_tbl;
+static SPU_THREAD_LOCAL spu_ibc_tbl t_ibcs;
+void* spu_ibc_tls(void) { return &t_ibcs; }   /* spu_tls_refresh */
+/* This thread's table: through the context's cache (spu_context.h) on macOS. */
+static inline spu_ibc_tbl* spu_ibc_of(spu_context* ctx)
+{
+#if SPU_TLS_CACHE
+    spu_tls_check(ctx);
+    return (spu_ibc_tbl*)ctx->tls_ibc;
+#else
+    (void)ctx;
+    return &t_ibcs;
+#endif
+}
 static int s_ibc_on = -1;
 static __attribute__((noinline)) int spu_ibc_init(void)
 {
@@ -3269,21 +3447,23 @@ static inline int spu_ibc_key(const spu_context* ctx, uint64_t* key, uint32_t* s
     *slot = ((ctx->pc >> 2) ^ (img * 0x9E37u) ^ (ovl * 0x85EBu)) & (IBC_SIZE - 1);
     return 1;
 }
-static inline spu_fn spu_ibc_probe(const spu_context* ctx)
+static inline spu_fn spu_ibc_probe(spu_context* ctx)
 {
     uint64_t key; uint32_t slot;
     if (!spu_ibc_key(ctx, &key, &slot)) return NULL;
+    spu_ibc_tbl* const t = spu_ibc_of(ctx);
     const uint32_t gen = spu_ibc_gen();
-    if (__builtin_expect(gen != t_ibcs.gen, 0)) { memset(t_ibcs.e, 0, sizeof t_ibcs.e); t_ibcs.gen = gen; return NULL; }
-    return t_ibcs.e[slot].key == key ? t_ibcs.e[slot].fn : NULL;
+    if (__builtin_expect(gen != t->gen, 0)) { memset(t->e, 0, sizeof t->e); t->gen = gen; return NULL; }
+    return t->e[slot].key == key ? t->e[slot].fn : NULL;
 }
-static inline void spu_ibc_fill(const spu_context* ctx, spu_fn fn)
+static inline void spu_ibc_fill(spu_context* ctx, spu_fn fn)
 {
     uint64_t key; uint32_t slot;
     if (!spu_ibc_key(ctx, &key, &slot)) return;
+    spu_ibc_tbl* const t = spu_ibc_of(ctx);
     const uint32_t gen = spu_ibc_gen();
-    if (gen != t_ibcs.gen) { memset(t_ibcs.e, 0, sizeof t_ibcs.e); t_ibcs.gen = gen; }
-    t_ibcs.e[slot].key = key; t_ibcs.e[slot].fn = fn;
+    if (gen != t->gen) { memset(t->e, 0, sizeof t->e); t->gen = gen; }
+    t->e[slot].key = key; t->e[slot].fn = fn;
 }
 
 void spu_indirect_branch(spu_context* ctx)
@@ -3310,7 +3490,9 @@ void spu_indirect_branch(spu_context* ctx)
      * enforce the preserve-all-registers hardware contract here -- the first
      * interrupts-enabled dispatch at the saved srr0 is the irete. */
     { extern int spu_irq_regs_maybe_restore(spu_context*);
-      if (spu_irq_regs_maybe_restore(ctx)) {
+      /* It returns 0 at once without a saved interrupt frame: test that here
+       * rather than pay a host call on every dispatch. */
+      if (ctx->irq_saved && spu_irq_regs_maybe_restore(ctx)) {
           static int s_it = -1; if (s_it < 0) s_it = getenv("SPU_IRQTRACE") ? 1 : 0;
           static int _r = 0;
           if (s_it && PS3_LOG_FIRST(_r, 200))
@@ -3333,7 +3515,7 @@ void spu_indirect_branch(spu_context* ctx)
             }
             if (plain) {
                 ctx->resident_task = 0;
-                spu_check_stack_reset(ctx, fn);
+                if (g_spu_stack_reset_count) spu_check_stack_reset(ctx, fn);
 #if defined(__clang__)
                 __attribute__((musttail)) return fn(ctx);
 #else
@@ -3422,7 +3604,8 @@ void spu_indirect_branch(spu_context* ctx)
                   s_slice = e ? (long long)f.QuadPart * atoll(e) / 1000000 : 0;
               }
               extern SPU_THREAD_LOCAL unsigned long long g_spurs_pm_t0;
-              LARGE_INTEGER q; QueryPerformanceCounter(&q);
+              LARGE_INTEGER q; q.QuadPart = 0;
+              if (s_slice > 0) QueryPerformanceCounter(&q);   /* a clock read per poll only when sliced */
               if (s_slice > 0 && (long long)((unsigned long long)q.QuadPart - g_spurs_pm_t0) < s_slice)
                   ctx->gpr[3]._u32[0] = ((uint32_t)ctx->ls[0x1DC] << 24) | ((uint32_t)ctx->ls[0x1DD] << 16) |
                                         ((uint32_t)ctx->ls[0x1DE] << 8) | ctx->ls[0x1DF];
@@ -3555,12 +3738,18 @@ void spu_indirect_branch(spu_context* ctx)
      * is 0 outside the region, so this only ever fires for genuine task code.) */
     spu_fn fn = NULL;
     int code_owner = 0;
+    int reloc_tried = 0;
+resolve_resident:
     for (uint32_t m = ctx->resident_code_mask; m; m &= m - 1) {
         const unsigned slot = (unsigned)__builtin_ctz(m);
         if (ctx->pc >= ctx->resident_code[slot].lsa &&
             ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
-            code_owner = ctx->resident_code[slot].image_id;
             const uint32_t canon = ctx->resident_code[slot].canon;
+            if (canon && !spu_reloc_slot_live(ctx, slot, ctx->pc)) {   /* overwritten since */
+                spu_reloc_slot_drop(ctx, slot);
+                continue;
+            }
+            code_owner = ctx->resident_code[slot].image_id;
             if (canon) {   /* relocatable code (spu_overlay_register_region_reloc) */
                 fn = spu_lookup(ctx->pc - ctx->resident_code[slot].lsa + canon, code_owner);
                 ctx->reloc_delta = (int32_t)(ctx->resident_code[slot].lsa - canon);
@@ -3576,6 +3765,11 @@ void spu_indirect_branch(spu_context* ctx)
      * may also be registered (historical junk lifts) and must lose. */
     if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
     if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* Nothing lifted here: a copy of relocatable code no GET registered? (spu_reloc_recover) */
+    if (!code_owner && !fn && !reloc_tried) {
+        reloc_tried = 1;
+        if (spu_reloc_recover(ctx)) goto resolve_resident;
+    }
     /* Only these lookups' answer goes into the dispatch cache: the fallbacks
      * below read local store or change the overlay. */
     const int ibc_fill = fn && !code_owner && !ctx->resident_task && s_ibc_on > 0 &&

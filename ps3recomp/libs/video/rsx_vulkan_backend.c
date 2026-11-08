@@ -105,6 +105,9 @@ typedef SRWLOCK pthread_mutex_t;
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   /* _dyld_get_image_vmaddr_slide: ftrace caller addresses */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -257,6 +260,7 @@ typedef struct vk_state {
     int              eng_active;      /* the register-file engine drives us */
     int              bc_ok;           /* textureCompressionBC enabled       */
     int              depth_bounds_ok; /* depthBounds enabled                */
+    int              mirror_clamp_ok; /* VK_KHR_sampler_mirror_clamp_to_edge */
     u32              max_dim;         /* maxImageDimension2D of the device  */
     int              windowed;
     SDL_Window*      window;
@@ -657,6 +661,8 @@ static void vk_invalidate(vk_buffer* b)
  * The queue is shared with the present (see present_mu in vk_state), so every
  * operation on it goes through these.
  * -------------------------------------------------------------------------*/
+/* Every queue submission's sequence number (one queue, executed in order). */
+static volatile uint64_t s_vk_sub_seq;
 static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
 {
     unsigned long long t = vk_slow_now();
@@ -665,8 +671,55 @@ static VkResult vk_queue_submit(const VkSubmitInfo* si, VkFence fence)
     t = vk_slow_now();
     const VkResult r = pvkQueueSubmit(s_vk.queue, 1, si, fence);
     vk_slow_note("submit: vkQueueSubmit", t);
+    if (r == VK_SUCCESS) s_vk_sub_seq++;
     pthread_mutex_unlock(&s_vk.queue_mu);
     return r;
+}
+
+/* Deferred texture destruction (VK_TEX_DEFER=0: destroy at once, after waiting
+ * for the GPU, as before). A released texture may still be sampled by the
+ * batches in flight and by the open one, so destroying it meant vk_eng_idle()
+ * -- a wait for every batch -- per release: ~40 a second for GoW:A's grading
+ * LUT and hundreds while a scene streams textures into a full cache. Instead it
+ * waits here, tagged with the first submission that can follow its last use,
+ * and goes once a batch fence at or past that has been seen to signal. Walker
+ * thread only (the engine's own submissions; a present never samples one). */
+#define VK_GRAVE_N 4096u
+static struct { VkImage img; VkImageView view; VkDeviceMemory mem; uint64_t seq; } s_grave[VK_GRAVE_N];
+static u32 s_grave_n;
+static int vk_tex_defer(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("VK_TEX_DEFER"); on = !(e && *e == '0'); }
+    return on;
+}
+static void vk_grave_destroy(u32 i)
+{
+    if (s_grave[i].view) pvkDestroyImageView(s_vk.device, s_grave[i].view, NULL);
+    if (s_grave[i].img)  pvkDestroyImage(s_vk.device, s_grave[i].img, NULL);
+    if (s_grave[i].mem)  pvkFreeMemory(s_vk.device, s_grave[i].mem, NULL);
+}
+/* Every submission up to `done` has completed: destroy what waited for it. */
+static void vk_grave_done(uint64_t done)
+{
+    u32 k = 0; int waited = 0;
+    for (u32 i = 0; i < s_grave_n; i++) {
+        if (s_grave[i].seq <= done) {
+            /* As vk_destroy_image: never under a present's copy that may read it. */
+            if (!waited) { vk_present_wait_gpu(); waited = 1; }
+            vk_grave_destroy(i);
+        } else s_grave[k++] = s_grave[i];
+    }
+    s_grave_n = k;
+}
+/* 1 = queued, 0 = the caller destroys it the old way. */
+static int vk_grave_push(VkImage img, VkImageView view, VkDeviceMemory mem)
+{
+    if (!vk_tex_defer() || s_grave_n >= VK_GRAVE_N) return 0;
+    s_grave[s_grave_n].img = img; s_grave[s_grave_n].view = view; s_grave[s_grave_n].mem = mem;
+    s_grave[s_grave_n].seq = s_vk_sub_seq + 1u;   /* the next submission carries the open batch */
+    s_grave_n++;
+    return 1;
 }
 
 static VkResult vk_queue_present(const VkPresentInfoKHR* pi)
@@ -781,6 +834,11 @@ static __attribute__((noinline)) int vk_submit_and_wait(void)
 #ifdef _WIN32
     const uint32_t ft_ra = ft_t0 ? (uint32_t)((uintptr_t)__builtin_return_address(0) -
                                               (uintptr_t)GetModuleHandleA(NULL)) : 0;
+#elif defined(__APPLE__)
+    /* The static address less the 0x100000000 base, as `atos -o <exe> -l 0x100000000
+     * 0x1<b>` takes it: ASLR's slide removed. */
+    const uint32_t ft_ra = ft_t0 ? (uint32_t)((uintptr_t)__builtin_return_address(0) -
+                                              (uintptr_t)_dyld_get_image_vmaddr_slide(0) - 0x100000000ull) : 0;
 #else
     const uint32_t ft_ra = (uint32_t)(uintptr_t)__builtin_return_address(0);
 #endif
@@ -790,9 +848,11 @@ static __attribute__((noinline)) int vk_submit_and_wait(void)
                         .commandBufferCount = 1, .pCommandBuffers = &s_vk.cmd };
     VK_CHECK(pvkResetFences(s_vk.device, 1, &s_vk.fence), "vkResetFences");
     VK_CHECK(vk_queue_submit(&si, s_vk.fence), "vkQueueSubmit");
+    const uint64_t my_seq = s_vk_sub_seq;
     g_vk_fence_waiting = 1;
     const unsigned long long sw = vk_slow_now();
     VkResult wr = pvkWaitForFences(s_vk.device, 1, &s_vk.fence, VK_TRUE, UINT64_MAX);
+    if (wr == VK_SUCCESS && s_grave_n) vk_grave_done(my_seq);
     vk_slow_note("submit_and_wait: fence", sw);
     g_vk_fence_waiting = 0;
     if (ft_t0) {
@@ -899,13 +959,20 @@ static int vk_upload_texture(vk_image* dst, const u8* rgba, u32 w, u32 h)
  * backend and the live draw engine use: 1 WRAP, 2 MIRROR, 3 CLAMP_TO_EDGE,
  * 4 BORDER, 5 CLAMP, 6..8 MIRROR_ONCE. Vulkan 1.0 has MIRROR_CLAMP_TO_EDGE
  * only behind an extension, so the MIRROR_ONCE family clamps to edge here --
- * exact for texcoords in [0,1], the mirrored half is what is lost. */
+ * exact for texcoords in [0,1], the mirrored half is what is lost. Where the
+ * device has VK_KHR_sampler_mirror_clamp_to_edge (MoltenVK: Metal's
+ * mirrorClampToEdge) the family mirrors once, as RSX does: a texture laid on
+ * [-1,1] with MIRROR_ONCE otherwise smears its edge texels over the negative
+ * half (GoW:A's illusion arena after Megaera). RSX_VK_MIRROR_ONCE=0 clamps. */
 static VkSamplerAddressMode vk_gcm_wrap(u32 w)
 {
     switch (w & 0xFu) {
     case 1:  return VK_SAMPLER_ADDRESS_MODE_REPEAT;
     case 2:  return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
     case 4:  return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case 6: case 7: case 8:
+        if (s_vk.mirror_clamp_ok) return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE;
+        return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;      /* 3, 5..8, unset */
     }
 }
@@ -2642,6 +2709,13 @@ static void vk_eng_release(void* user, u32 handle)
     }
     if (s_eobj[handle].kind == VK_ENG_COLOR || s_eobj[handle].kind == VK_ENG_DEPTH)
         vk_eng_drop_framebuffers();
+    /* A texture is only ever sampled or copied by the engine's own batches:
+     * destroyed once they have run (vk_grave_push), not after a full wait. */
+    if (s_eobj[handle].kind == VK_ENG_TEXTURE &&
+        vk_grave_push(s_eobj[handle].im.img, s_eobj[handle].im.view, s_eobj[handle].im.mem)) {
+        memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
+        return;
+    }
     vk_destroy_image(&s_eobj[handle].im);      /* idle: submissions are waited on */
     memset(&s_eobj[handle], 0, sizeof s_eobj[handle]);
 }
@@ -2652,6 +2726,7 @@ static void vk_eng_shutdown(void* user)
 {
     vk_eng2_shutdown(user);
     for (u32 i = 1; i < VK_ENG_MAX_OBJ; i++) vk_eng_release(user, i);
+    vk_eng_idle();                 /* and the textures waiting for their batches go */
     vk_eng_snapshot_pool_drain();
     vk_destroy_buffer(&s_rb_stage);
     vk_destroy_buffer(&s_up_stage);
@@ -2970,10 +3045,19 @@ static u32 vk_eng_texture_create(void* user, rsx_be_format fmt, u32 w, u32 h,
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = (u8)cube; o->mips = mips;
     o->bpp = bc ? 0 : bpp; o->block = bc ? bpp : 0;
-    /* UNDEFINED -> GENERAL for every level and face before the uploads arrive. */
-    if (vk_begin()) goto fail;
-    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (vk_submit_and_wait()) goto fail;
+    /* UNDEFINED -> GENERAL for every level and face before the uploads arrive.
+     * With draw batching it is one more operation of the open batch, ahead of
+     * the uploads that follow it there (vk_eb_upload), like the clears: as a
+     * synchronous submit it waited for every batch in flight (one in-order
+     * queue) once per new texture -- ~6 a frame at ~0.9 ms each while a GoW:A
+     * scene streams its textures in. VK_TEX_CREATE_SYNC=1 keeps the wait. */
+    {   static int s_sync = -1;
+        if (s_sync < 0) { const char* e = getenv("VK_TEX_CREATE_SYNC"); s_sync = (e && *e == '1') ? 1 : 0; }
+        const int batched = vk_eb_active() && !s_sync;
+        if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) goto fail;
+        vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+        if (batched) vk_eb_recorded();
+        else if (vk_submit_and_wait()) goto fail; }
     return hd;
 fail:
     vk_destroy_image(&o->im);
@@ -3029,9 +3113,14 @@ static u32 vk_eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
         goto fail;
     o->kind = VK_ENG_TEXTURE; o->fmt = vf; o->w = w; o->h = h; o->cube = 2; o->mips = mips;
     o->bpp = bpp; o->block = 0; o->depth3d = depth;
-    if (vk_begin()) goto fail;
-    vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    if (vk_submit_and_wait()) goto fail;
+    /* Batched like vk_eng_texture_create's: GoW:A recreates its 32^3 grading
+     * LUT whenever it changes (a volume is create-and-swap), ~40 times a second. */
+    {   const char* e = getenv("VK_TEX_CREATE_SYNC");
+        const int batched = vk_eb_active() && !(e && *e == '1');
+        if (batched ? (!s_eb_pending && vk_begin()) : vk_begin()) goto fail;
+        vk_barrier_image(o->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+        if (batched) vk_eb_recorded();
+        else if (vk_submit_and_wait()) goto fail; }
     return hd;
 fail:
     vk_destroy_image(&o->im);
@@ -4621,6 +4710,10 @@ static VkSampler vk_eng_sampler(const rsx_be_sampler_desc* d)
     const u64 key2 = key ^ ((u64)bc << 48) ^ ((u64)(bc != VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK) << 47);
     for (u32 i = 0; i < s_esamp_count; i++) if (s_esamp[i].key == key2) return s_esamp[i].s;
     if (s_esamp_count >= VK_ENG_SAMP_CACHE) return s_vk.sampler;
+    /* Each new sampler with a wrap mode past CLAMP_TO_EDGE, once: which scenes use them. */
+    if ((d->wrap_s & 0xF) >= 4 || (d->wrap_t & 0xF) >= 4)
+        fprintf(stderr, "[vk-sampler] wrap s%u t%u r%u border %08X (sampler %u)\n", d->wrap_s & 0xF,
+                d->wrap_t & 0xF, d->wrap_r & 0xF, d->border_color, s_esamp_count);
     float min_lod = d->min_lod, max_lod = d->mip_present ? d->max_lod : d->min_lod;
     if (max_lod < min_lod) max_lod = min_lod;
     VkSamplerCreateInfo sci = {
@@ -4723,7 +4816,8 @@ static struct {
     VkDescriptorPool pool;          /* the current slot's */
     u32              sets;
     u32              cur;           /* current slot */
-    struct { VkCommandBuffer cmd, pro; VkFence fence; VkDescriptorPool pool; u32 sets; int busy, pro_open; } slot[VK_EB_SLOTS];
+    struct { VkCommandBuffer cmd, pro; VkFence fence; VkDescriptorPool pool; u32 sets; int busy, pro_open;
+             uint64_t seq; /* vk_queue_submit's count after its last submission (vk_grave_done) */ } slot[VK_EB_SLOTS];
     unsigned long long draws, flushes, slot_waits;
 } s_eb = { .on = -1 };
 
@@ -4744,6 +4838,8 @@ static void vk_eb_use_slot(u32 i)
         s_eb.slot[i].busy = 0;
         s_eb.slot_waits++;
     }
+    /* This slot's last batch has completed, and with it everything before it. */
+    if (s_grave_n) vk_grave_done(s_eb.slot[i].seq);
     if (s_eb.slot[i].sets) { pvkResetDescriptorPool(s_vk.device, s_eb.slot[i].pool, 0); s_eb.slot[i].sets = 0; }
     s_eb.cur = i;
     s_vk.cmd = s_eb.slot[i].cmd;
@@ -4779,6 +4875,8 @@ static void vk_eng_idle(void)
             g_vk_fence_waiting = 0;
             s_eb.slot[i].busy = 0;
         }
+    /* Every engine batch has completed: nothing queued for destruction is still in use. */
+    if (s_grave_n) vk_grave_done(~(uint64_t)0);
 }
 
 static int vk_eb_on(void)
@@ -4910,8 +5008,10 @@ static void vk_eng_flush(void)
             cbs[ncb++] = s_vk.cmd;
             VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                                 .commandBufferCount = ncb, .pCommandBuffers = cbs };
-            if (vk_queue_submit(&si, s_vk.fence) == VK_SUCCESS) s_eb.slot[s_eb.cur].busy = 1;
-            else VK_LOG("draw batching: vkQueueSubmit failed\n");
+            if (vk_queue_submit(&si, s_vk.fence) == VK_SUCCESS) {
+                s_eb.slot[s_eb.cur].busy = 1;
+                s_eb.slot[s_eb.cur].seq = s_vk_sub_seq;
+            } else VK_LOG("draw batching: vkQueueSubmit failed\n");
         }
         vk_eb_use_slot((s_eb.cur + 1u) % VK_EB_SLOTS);
     } else {
@@ -5638,15 +5738,21 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
+    const char* dev_exts[4];
+    u32 n_dev_exts = 0;
+    if (s_vk.windowed) dev_exts[n_dev_exts++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 #ifdef __APPLE__
     /* A portability device must have VK_KHR_portability_subset enabled. */
-    static const char* dev_exts_all[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME, "VK_KHR_portability_subset" };
-    const char** dev_exts = s_vk.windowed ? dev_exts_all : dev_exts_all + 1;
-    const u32 n_dev_exts = s_vk.windowed ? 2u : 1u;
-#else
-    static const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
-    const u32 n_dev_exts = s_vk.windowed ? 1u : 0u;
+    dev_exts[n_dev_exts++] = "VK_KHR_portability_subset";
 #endif
+    /* RSX's MIRROR_ONCE wrap modes (see vk_gcm_wrap). */
+    { const char* e = getenv("RSX_VK_MIRROR_ONCE");
+      if ((!e || atoi(e) != 0) && vk_has_device_extension(s_vk.phys, "VK_KHR_sampler_mirror_clamp_to_edge")) {
+          dev_exts[n_dev_exts++] = "VK_KHR_sampler_mirror_clamp_to_edge";
+          s_vk.mirror_clamp_ok = 1;
+      }
+      fprintf(stderr, "[vulkan] MIRROR_ONCE wrap: %s\n", s_vk.mirror_clamp_ok ? "mirror clamp to edge"
+                                                                                 : "clamp to edge (approximation)"); }
     /* DXT (BC1-3) is how PS3 titles ship most textures; Vulkan gates it
      * behind a feature, enabled only when the device reports it. */
     VkPhysicalDeviceFeatures have, want;

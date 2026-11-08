@@ -260,6 +260,74 @@ def _is_identity_move(insn) -> bool:
     return len(ops) == 3 and ops[0] == ops[1] and ops[2].strip() in ("0", "0x0")
 
 
+def compute_const_bi_targets(insns, bounds, max_cands: int = 4) -> dict:
+    """Constant candidate targets of computed branches (`bi $rX`, biz family).
+
+    EDGE geometry loops often close without a conditional branch:
+
+        ila  $r26, loop_head
+        ...
+        selb $r31, $r26, $r0, $r30    ; r31 = done ? r0 : loop_head
+        bi   $r31
+
+    Lifted as a computed branch, every iteration went back to the drain loop
+    and the full resolver (spu_indirect_branch): ~300k dispatches a second in
+    GoW:A's busiest scenes. This finds the constants the target register can
+    hold -- the nearest earlier writer in the same function, looked through
+    selb (both data inputs) and identity moves -- so the emitter can test the
+    runtime value against them and branch directly on a match. The test is on
+    the runtime value, so a wrong guess here only costs a compare: anything
+    else still takes the resolver.
+    Returns {bi address: [target, ...]}.
+    """
+    by_addr = {i.addr: i for i in insns}
+    out = {}
+
+    def writer(reg, before, lo):
+        a = before - 4
+        while a >= lo:
+            w = by_addr.get(a)
+            if w is not None and w.mnemonic not in _NO_RT_WRITE and _dest_reg(w) == reg \
+                    and not _is_identity_move(w):
+                return w
+            a -= 4
+        return None
+
+    def consts(reg, before, lo, depth, acc):
+        w = writer(reg, before, lo)
+        if w is None or depth > 3:
+            return
+        mn = w.mnemonic
+        ops = _ops(w.operands)
+        if mn in ("ila", "il") and len(ops) >= 2:
+            try:
+                v = int(_imm(ops[1]), 0)
+            except ValueError:
+                return
+            if 0 <= v < 0x40000:
+                acc.add(v & 0x3FFFC)
+        elif mn == "selb" and len(ops) >= 4:
+            consts(int(_reg(ops[1])), w.addr, lo, depth + 1, acc)
+            consts(int(_reg(ops[2])), w.addr, lo, depth + 1, acc)
+        elif mn in ("ori", "ai") and len(ops) == 3 and ops[2].strip() in ("0", "0x0"):
+            consts(int(_reg(ops[1])), w.addr, lo, depth + 1, acc)
+
+    for s, e in bounds:
+        for i in insns:
+            if i.addr < s or i.addr >= e:
+                continue
+            r = _bi_target_reg(i)
+            if r is None or r == "0":
+                continue
+            acc = set()
+            # The loop's constant is often set up just before the loop head,
+            # which starts its own function: look up to 256 instructions back.
+            consts(int(r), i.addr, max(0, s - 0x400), 0, acc)
+            if acc:
+                out[i.addr] = sorted(acc)[:max_cands]
+    return out
+
+
 def compute_bi_r0_jumps(insns, bounds) -> set:
     """`bi $r0` (and conditional `biz/binz $r0`) is normally a function RETURN
     (r0 = link register). But Sony's SPU code also uses it as a COMPUTED TAIL
@@ -535,6 +603,8 @@ class SPULifter:
         # compute_link_returns(). Emitted as `return;` so they compose with the
         # brsl->C-call nesting instead of branching to an unregistered PC.
         self.link_return: set = set()
+        # {bi address: [constant target, ...]} -- compute_const_bi_targets().
+        self.const_bi: dict = {}
 
     # ------------------------------------------------------------------ #
     def lift_function(self, insns: list[SPUInstruction],
@@ -549,6 +619,9 @@ class SPULifter:
             tgt = self._branch_target(insn)
             if tgt is not None and start <= tgt < end:
                 internal.add(tgt)
+            for c in self._const_bi_cands(insn.addr):
+                if start <= c < end:
+                    internal.add(c)
 
         last_insn = None
         for insn in insns:
@@ -600,6 +673,34 @@ class SPULifter:
 
         self.functions.append(func)
         return func
+
+    def _const_bi_cands(self, addr: int) -> list:
+        if self.reloc:
+            return []
+        return self.const_bi.get(addr, [])
+
+    def _const_bi_dispatch(self, addr: int, reg: str, func, ied: str) -> str:
+        """Direct branches for the constant targets a computed branch can take
+        (compute_const_bi_targets); empty when there are none. A target inside
+        this function becomes a goto unless the branch changes the interrupt
+        enable; one that starts a lifted function, a direct tail (SPU_DIRECT
+        still declines whenever the drain has work on this step)."""
+        parts = []
+        starts = getattr(self, "func_starts", set())
+        for c in self._const_bi_cands(addr):
+            if func.start_addr <= c < func.end_addr:
+                if ied:
+                    continue
+                parts.append(f"if (_bt == 0x{c:X}u && !g_spu_stack_reset_hint[0x{(c >> 2) & 1023:X}] && "
+                             f"!(ctx->int_enable && (ctx->event_status & ctx->event_mask))) goto loc_{c:08X};")
+            elif c in starts:
+                self.branch_targets.add(c)
+                parts.append(f"if (_bt == 0x{c:X}u) {{ SPU_DIRECT(ctx, 0x{c:X}, "
+                             f"{self.prefix}spu_func_{c:08X}); }}")
+        if not parts:
+            return ""
+        return (f"{{ const uint32_t _bt = ctx->gpr[{reg}]._u32[0] & 0x3FFFFu; "
+                + " ".join(parts) + " } ")
 
     def _pc(self, a: int) -> str:
         """A local-store address derived from the code's own placement: a constant, or
@@ -980,7 +1081,7 @@ class SPULifter:
                     return f"{_ied}SPU_RET_REG(ctx, {tgt_reg});"
                 return f"{_ied}SPU_RET(ctx);"
             # Computed indirect tail: set pc + trampoline to the dispatcher, unwind.
-            return (f"{_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+            return (f"{_ied}{self._const_bi_dispatch(addr, tgt_reg, func, _ied)}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return;")
         # iret: interrupt return -> branch to the saved interrupt PC (SRR0).
         if mn == "iret":
@@ -1029,7 +1130,7 @@ class SPULifter:
                 if tgt_reg != "0":
                     return f"if ({cond}) {{ {_ied}SPU_RET_REG(ctx, {tgt_reg}); }}"
                 return f"if ({cond}) {{ {_ied}SPU_RET(ctx); }}"
-            return (f"if ({cond}) {{ {_ied}ctx->pc = {g(tgt_reg)}._u32[0]; "
+            return (f"if ({cond}) {{ {_ied}{self._const_bi_dispatch(addr, tgt_reg, func, _ied)}ctx->pc = {g(tgt_reg)}._u32[0]; "
                     f"g_spu_trampoline_fn = spu_indirect_branch; return; }}")
 
         # hint-for-branch: pure performance hint, safe to drop
@@ -1333,6 +1434,8 @@ def main() -> None:
               f"(r0 set by lqa/lqr/il/ila, not a link): "
               f"{', '.join(f'0x{a:X}' for a in sorted(lifter.bi_r0_jump))}")
     lifter.link_return = compute_link_returns(insns, bounds)
+    if os.environ.get("SPU_LIFT_CONST_BI", "0") == "1":
+        lifter.const_bi = compute_const_bi_targets(insns, bounds)
     if args.force_indirect:
         forced = {int(x, 0) for x in args.force_indirect.split(",") if x.strip()}
         dropped = lifter.link_return & forced

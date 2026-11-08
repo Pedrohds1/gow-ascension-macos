@@ -17,6 +17,13 @@ if [ -n "$SAVE" ]; then
     case "$SAVE" in /*) src=$SAVE ;; *) src="$here/$SAVE" ;; esac
     cp -R "$src/." "$out/" || exit 1
 fi
+# HDD1_DE=<pasta hdd1>: começa com uma cópia desse cache da FIOS (clone APFS, sem gastar
+# espaço) em vez do cache vazio. Os testes sempre partiam de cache vazio e por isso nunca
+# leram o bloco estragado do cache do Pedro (scripts/cache_fios.py).
+if [ -n "$HDD1_DE" ]; then
+    case "$HDD1_DE" in /*) h1=$HDD1_DE ;; *) h1="$here/$HDD1_DE" ;; esac
+    cp -Rc "$h1/." "$out/hdd1/" 2>/dev/null || cp -R "$h1/." "$out/hdd1/" || exit 1
+fi
 
 iso="$here/../God of War - Ascension (Europe, Australia) (En,Fr,De,Es,It,Nl,Pt,Pl,Ru,El,Tr).iso"
 if [ ! -d "$here/work/disc/PS3_GAME" ]; then

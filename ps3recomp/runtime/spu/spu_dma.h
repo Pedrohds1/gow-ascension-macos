@@ -220,11 +220,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * cannot detect that a peer's reservation was lost. Issuer exclusion
          * follows the existing plain-MFC-write model; issuer reservation
          * behavior for storage controls is not separately modeled here. */
-        spu_lockline_lock();
+        spu_lockline_lock_span((uint32_t)ea, size);
         memset(vm_base + (uint32_t)ea, 0, size);
         for (uint32_t offset = 0; offset < size; offset += 128u)
             spu_coh_notify_write_except((uint32_t)ea + offset, spu);
-        spu_lockline_unlock();
+        spu_lockline_unlock_span((uint32_t)ea, size);
         if (g_spu_jobcap_on > 0) spu_jobcap_xfer(spu, cmd, ea, 0, size, vm_base + (uint32_t)ea);
         return 0;
     }
@@ -785,20 +785,22 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 } else memcpy(ea_ptr, ls_ptr, size); } while (0)
 #endif
             if (span_reserved) {
-                spu_lockline_lock();
+                /* The stripes of the lines this PUT covers (SPU_LOCKLINE_STRIPES;
+                 * every stripe once it covers as many lines). */
+                spu_lockline_lock_span((uint32_t)ea, size);
                 SPU_PUT_COPY();
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
                     if (a == a1) break;
                 }
-                spu_lockline_unlock();
+                spu_lockline_unlock_span((uint32_t)ea, size);
             } else {
                 SPU_PUT_COPY();
                 for (uint32_t a = a0; ; a += 128u) {
                     if (spu_coh_is_reserved(a)) {
-                        spu_lockline_lock();
+                        spu_lockline_lock_line(a);
                         spu_coh_notify_write_except(a, spu);
-                        spu_lockline_unlock();
+                        spu_lockline_unlock_line(a);
                     }
                     if (a == a1) break;
                 }

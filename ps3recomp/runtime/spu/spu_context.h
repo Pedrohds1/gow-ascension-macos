@@ -414,6 +414,20 @@ typedef struct spu_context {
      * spu_coh_reserve_fast). Written under that lock, read by the context's
      * own thread. */
     int coh_listed;
+    /* 1 + this context's slot in spu_coherency.c's holder table (0 = none).
+     * Trusted only when the table's slot points back at this context, so a
+     * context that was not zeroed cannot name another's slot. */
+    int coh_slot1;
+    /* The per-thread state the dispatch paths touch on every lifted call and
+     * transfer, as this context's thread sees it (spu_tls_check): on Mach-O a
+     * _Thread_local access is a call to _tlv_get_addr, which every lifted call
+     * site paid, with the registers it spills around it. Valid while the
+     * context runs on the stack [tls_stk_lo, tls_stk_lo + tls_stk_sz); zero
+     * until it first dispatches. */
+    uintptr_t tls_stk_lo, tls_stk_sz;
+    void (**tls_tramp)(struct spu_context*);    /* &g_spu_trampoline_fn */
+    void* tls_ibc;                               /* spu_channels.c's dispatch cache */
+    void* tls_recent;                            /* spu_drain.c's ring of recent pcs */
 } spu_context;
 
 /* event_status is written from more than one host thread: the SPU's own
@@ -863,6 +877,40 @@ void spu_indirect_branch(spu_context* ctx);
  * spu_context is pinned to one host thread for its lifetime. */
 extern SPU_THREAD_LOCAL void (*g_spu_trampoline_fn)(spu_context*);
 
+/* SPU_TLS_CACHE (default on macOS, where a thread-local access is a call): the
+ * dispatch paths reach g_spu_trampoline_fn and the other per-thread state
+ * through pointers cached in the context, checked against the stack the caller
+ * runs on -- a subtraction and a compare, no call. A context is pinned to one
+ * host thread; should it run on another stack, spu_tls_refresh takes that
+ * thread's pointers. SPU_TLS_CACHE=0 at build time reads the thread-locals. */
+#ifndef SPU_TLS_CACHE
+#  if defined(__APPLE__)
+#    define SPU_TLS_CACHE 1
+#  else
+#    define SPU_TLS_CACHE 0
+#  endif
+#endif
+#if SPU_TLS_CACHE
+void spu_tls_refresh(spu_context* ctx);   /* spu_drain.c */
+static inline void spu_tls_check(spu_context* ctx)
+{
+#if defined(__aarch64__)
+    uintptr_t sp; __asm__("mov %0, sp" : "=r"(sp));
+#else
+    const uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+#endif
+    if (__builtin_expect(sp - ctx->tls_stk_lo >= ctx->tls_stk_sz, 0)) spu_tls_refresh(ctx);
+}
+static inline void (**spu_tramp_slot(spu_context* ctx))(spu_context*)
+{
+    spu_tls_check(ctx);
+    return ctx->tls_tramp;
+}
+#else
+static inline void spu_tls_check(spu_context* ctx) { (void)ctx; }
+static inline void (**spu_tramp_slot(spu_context* ctx))(spu_context*) { (void)ctx; return &g_spu_trampoline_fn; }
+#endif
+
 /* Ring of the last PCs this SPU thread executed, for the unlifted-branch
  * report. The dispatcher records indirect branches; SPU_DRAIN records every
  * trampoline hop, which is the one that actually precedes a bad branch. */
@@ -875,8 +923,12 @@ void spu_task_launch_check(spu_context* ctx, void* fn); /* SPURS task-launch    
 /* Both of the above for one trampoline hop, with the common case inline. */
 void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*));
 /* Restore image_id after a call-bracket (adopt-on-serve); re-applies the
- * persistent LS-0xA00 workload module if one is set. */
-void spu_img_restore(spu_context* ctx, int32_t saved_img);
+ * persistent LS-0xA00 workload module if one is set. Inline: every lifted call
+ * runs it, and out of line it was a host call per SPU call. */
+static inline void spu_img_restore(spu_context* ctx, int32_t saved_img)
+{
+    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;
+}
 /* Wake a host thread blocked in a channel wait (channel-stall milestone). */
 void spu_ch_wake(spu_context* ctx);
 /* Runaway lifted-call recursion guard. A lifted brsl/bisl nests a real host
@@ -901,8 +953,33 @@ void (*spu_take_interrupt(spu_context* ctx,
 SPU_GATE int g_spu_irqwait_diag = -1;
 void spu_irqwait_diag(spu_context* ctx);
 
-/* Drain a translated call up to its explicit architectural return PC. */
-void spu_drain_call(spu_context* ctx, uint32_t return_pc);
+/* Drain a translated call up to its explicit architectural return PC.
+ * Nearly every lifted call comes back through SPU_RET on its own host frame:
+ * no transfer pending and pc already at the return address. That case is
+ * inline below (one thread-local load the compiler keeps per function, a few
+ * compares and one store); everything else runs the full loop in spu_drain.c.
+ * Out of line, the common case was a host call per SPU call, plus the Mach-O
+ * thread-local lookup (_tlv_get_addr) each time: ~8% of a game-job SPU
+ * thread on the M4. Built with SPU_DRAIN_INLINE=0 it is the old call. */
+void spu_drain_call_slow(spu_context* ctx, uint32_t return_pc);
+extern uint32_t g_spu_drain_depth_max;   /* spu_drain.c: SPU_HOST_DEPTH_MAX once read, 0 before */
+extern volatile int g_spu_direct;        /* spu_drain.c: -1 unread, 0 off, 1 on */
+#ifndef SPU_DRAIN_INLINE
+#define SPU_DRAIN_INLINE 1
+#endif
+static inline void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+{
+#if SPU_DRAIN_INLINE
+    if (__builtin_expect(!*spu_tramp_slot(ctx) &&
+                         !((ctx->pc ^ return_pc) & SPU_LS_MASK) &&
+                         ctx->host_depth < g_spu_drain_depth_max &&
+                         g_spu_direct >= 0, 1)) {
+        ctx->drain_ret_pc = 0;   /* what the full loop's exit does */
+        return;
+    }
+#endif
+    spu_drain_call_slow(ctx, return_pc);
+}
 /* SPU_PCHIST=1: bucket SPU execution by the GPU module's own symbols.
  *
  * SPU_VRAMPC showed 3.7M VRAM writes from Host2Local_Body and ZERO from
@@ -1022,6 +1099,14 @@ void spu_direct_init(void);
         g_spu_trampoline_fn = FN;                                             \
         return;                                                               \
     } while (0)
+#endif
+
+/* Lifted SPU code (the TUs built with SPU_USE_DISPATCH_MT, where the context
+ * is always `ctx`) sets and tests the pending transfer through the cache too:
+ * SPU_DIRECT/SPU_RET/SPU_RET_REG below and the generator's own
+ * `g_spu_trampoline_fn = ...` lines. */
+#if SPU_TLS_CACHE && defined(SPU_USE_DISPATCH_MT)
+#define g_spu_trampoline_fn (*spu_tramp_slot(ctx))
 #endif
 
 /* Depth-aware SPU link return (`bi $r0`): host `return` while a matched

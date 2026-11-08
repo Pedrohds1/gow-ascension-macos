@@ -213,6 +213,57 @@ static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */  
 static DIR*  g_dirs[FS_MAX];
 static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
 
+/* Seek/transfer race detector (always on, two atomics per call). cellFsLseek
+ * and the cellFsRead/cellFsWrite it positions are two calls on a position the
+ * fd shares between threads; when another thread repositions the same fd in
+ * between, the transfer lands at that thread's position. That is what damaged
+ * GoW:A's FIOS disk cache (hdd1/.../fios/cache.dat): one 1 MiB block of
+ * HECA.PSARC held, from byte 0xD9D on, the CYN.PSARC block meant for another
+ * slot -- a 1 MiB write that started where a 0xD9D-byte read on the same fd
+ * had left the position. Each transfer that follows its own thread's lseek
+ * after another thread's lseek of that fd is reported as [fs-race]. */
+/* Report only, never changes a position. The fd position is SHARED on
+ * purpose: GoW:A's FIOS splits one cache-block write into 64 KB writes that
+ * different media threads issue in turn, each continuing where the previous
+ * one left the position (giving each thread its own position broke exactly
+ * that and corrupted GAME.PSARC blocks of a fresh cache). What is reported is
+ * the pattern that did damage the cache: a thread's lseek followed, before
+ * that thread's next transfer, by ANOTHER thread's lseek of the same fd. */
+#ifdef _WIN32
+#  define FS_LOCK(f)   _lock_file(f)
+#  define FS_UNLOCK(f) _unlock_file(f)
+#else
+#  define FS_LOCK(f)   flockfile(f)
+#  define FS_UNLOCK(f) funlockfile(f)
+#endif
+static std::atomic<uint32_t> g_fd_gen[FS_MAX];
+static std::atomic<uint32_t> g_seek_seq[FS_MAX];
+static std::atomic<uint64_t> g_seek_tid[FS_MAX];
+static thread_local uint32_t t_my_seek_seq[FS_MAX];
+static thread_local int64_t  t_my_seek_pos[FS_MAX];
+static std::atomic<uint32_t> g_fs_races{0};
+static void fs_seek_note(int fd, uint64_t tid, int64_t pos)
+{
+    t_my_seek_seq[fd] = ++g_seek_seq[fd];
+    t_my_seek_pos[fd] = pos;
+    g_seek_tid[fd].store(tid);
+}
+static void fs_xfer_begin(int fd, FILE* f, uint64_t tid, const char* op, uint64_t n, uint32_t lr)
+{
+    const uint32_t mine = t_my_seek_seq[fd];
+    if (!mine) return;
+    t_my_seek_seq[fd] = 0;
+    if (g_seek_seq[fd].load() == mine || g_seek_tid[fd].load() == tid) return;
+    const uint32_t k = ++g_fs_races;
+    if (k <= 16 || (k % 256) == 0)
+        fprintf(stderr, "[fs-race] %s fd=%d (%s) by tid %llu: its lseek to 0x%llX was followed by an lseek "
+                "of tid %llu; the transfer starts at 0x%llX (%llu bytes, lr 0x%08X) [race %u]\n",
+                op, fd, g_fd_path[fd], (unsigned long long)tid, (unsigned long long)t_my_seek_pos[fd],
+                (unsigned long long)g_seek_tid[fd].load(), (unsigned long long)FS_TELL64(f),
+                (unsigned long long)n, lr, k);
+}
+static void fs_xfer_end(int fd, FILE* f, uint64_t tid) { (void)fd; (void)f; (void)tid; }
+
 static int fd_alloc_file(FILE* f)
 {
     for (int i = 3; i < FS_MAX; i++) if (!g_files[i] && !g_dirs[i]) { g_files[i] = f; return i; }
@@ -281,6 +332,7 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    g_fd_gen[fd]++;   /* positions remembered for an earlier open of this number are void */
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
@@ -389,6 +441,7 @@ static void cellFsSdataOpen(ppu_context* ctx)
     }
     int fd = fd_alloc_file(f);
     if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
+    g_fd_gen[fd]++;   /* positions remembered for an earlier open of this number are void */
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     fprintf(stderr, "[fs] SdataOpen '%s' -> fd %d (magic %c%c%c%c)\n", gpath, fd,
             magic[0]?magic[0]:'?', magic[1]?magic[1]:'?', magic[2]?magic[2]:'?', magic[3]?magic[3]:'?');
@@ -440,7 +493,11 @@ static void cellFsRead(ppu_context* ctx)
     long long fpos_before = (long long)FS_TELL64(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
+    FS_LOCK(g_files[fd]);
+    fs_xfer_begin(fd, g_files[fd], ctx->thread_id, "read", nbytes, (uint32_t)ctx->lr);
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    fs_xfer_end(fd, g_files[fd], ctx->thread_id);
+    FS_UNLOCK(g_files[fd]);
     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
      * The intro cinematic is 28 seconds and this port renders it at a few frames
      * a second, so it cannot be watched to its end -- truncating the stream makes
@@ -507,7 +564,11 @@ static void cellFsWrite(ppu_context* ctx)
     uint32_t nwr_ptr = (uint32_t)ctx->gpr[6];
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
+    FS_LOCK(g_files[fd]);
+    fs_xfer_begin(fd, g_files[fd], ctx->thread_id, "write", nbytes, (uint32_t)ctx->lr);
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+    fs_xfer_end(fd, g_files[fd], ctx->thread_id);
+    FS_UNLOCK(g_files[fd]);
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -589,8 +650,11 @@ static void cellFsLseek(ppu_context* ctx)
     if (getenv("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] lseek fd=%d off=%lld whence=%u  (by %s)\n", fd, (long long)off, wh, w); }
     int worigin = (wh == CELL_FS_SEEK_END) ? SEEK_END : (wh == CELL_FS_SEEK_CUR) ? SEEK_CUR : SEEK_SET;
+    FS_LOCK(g_files[fd]);
     FS_SEEK64(g_files[fd], off, worigin);
     int64_t p = FS_TELL64(g_files[fd]);
+    fs_seek_note(fd, ctx->thread_id, p);
+    FS_UNLOCK(g_files[fd]);
     if (pos_ptr) vm_write64(pos_ptr, (uint64_t)p);
     ctx->gpr[3] = CELL_OK;
 }
@@ -921,6 +985,96 @@ static void cellFsAioRead(ppu_context* ctx)
                                  (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
 }
 
+/* cellFsAioWrite: the write half of the AIO pair. GoW:A's FIOS platform layer
+ * (0x627788) fills a CellFsAio, counts the request as pending and submits it
+ * here; with the NID unregistered the unresolved path answered CELL_OK, wrote
+ * nothing and never called back, so the request stayed pending forever and
+ * whatever the guest meant to store (its HDD block cache, hdd1/.../fios) never
+ * reached the file. Same contract as cellFsAioRead above: absolute offset, the
+ * fd's own position untouched, the callback before the submit returns. */
+static void cellFsAioWrite(ppu_context* ctx)
+{
+    uint32_t aio    = (uint32_t)ctx->gpr[3];
+    uint32_t id_ptr = (uint32_t)ctx->gpr[4];
+    uint32_t cb_opd = (uint32_t)ctx->gpr[5];
+
+    int      fd     = (int)guest_be32(aio + 0x00);
+    uint64_t offset = guest_be64(aio + 0x08);
+    uint32_t buf    = guest_be32(aio + 0x10);
+    uint64_t size   = guest_be64(aio + 0x18);
+
+    static std::atomic<int32_t> s_next_wid{0x40000001};
+    int32_t id = s_next_wid++;
+    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
+
+    size_t n = 0;
+    int32_t err = CELL_FS_ENOENT;
+    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+        fs_prefault(buf, size);
+        FILE* f = g_files[fd];
+        HOST_LOCKFILE(f);
+        const int64_t pos = (int64_t)HOST_FTELL64(f);
+        if (HOST_FSEEK64(f, offset) == 0) {
+            n = fwrite(vm_base + buf, 1, (size_t)size, f);
+            fflush(f);
+        }
+        if (pos >= 0) HOST_FSEEK64(f, pos);
+        HOST_UNLOCKFILE(f);
+        err = (n == size) ? CELL_OK : CELL_FS_EIO;
+    }
+    { static int n_log = 0;
+      if (getenv("PS3_FSLOG") || PS3_LOG_FIRST(n_log, 4))
+          fprintf(stderr, "[fs] aio write id=%d fd=%d off=%llu size=%llu -> %zu\n",
+                  id, fd, (unsigned long long)offset, (unsigned long long)size, n); }
+
+    ctx->gpr[3] = CELL_OK;
+    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
+                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
+}
+
+/* cellFsReadWithOffset(fd, u64 offset, buf, u64 size, u64* nread) and
+ * cellFsWriteWithOffset(fd, u64 offset, buf, u64 size, u64* nwrite): lv2's
+ * positioned I/O, which leaves the fd's position alone. GoW:A imports both
+ * (callers at 0x338464 / 0x338604). Unregistered, they returned CELL_OK
+ * without touching the buffer or the out-param: the caller then used a buffer
+ * that still held whatever an earlier request left in it. The stream lock is
+ * held across seek, transfer and the seek back, as in the AIO calls. */
+static void fs_positioned(ppu_context* ctx, int write)
+{
+    int fd           = (int)(uint32_t)ctx->gpr[3];
+    uint64_t offset  = ctx->gpr[4];
+    uint32_t buf     = (uint32_t)ctx->gpr[5];
+    uint64_t size    = ctx->gpr[6];
+    uint32_t out_ptr = (uint32_t)ctx->gpr[7];
+    if (fd < 0 || fd >= FS_MAX || !g_files[fd]) {
+        if (out_ptr) vm_write64(out_ptr, 0);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO;
+        return;
+    }
+    if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+    fs_prefault(buf, size);
+    FILE* f = g_files[fd];
+    size_t n = 0;
+    HOST_LOCKFILE(f);
+    const int64_t pos = (int64_t)HOST_FTELL64(f);
+    if (HOST_FSEEK64(f, offset) == 0) {
+        if (write) { n = fwrite(vm_base + buf, 1, (size_t)size, f); fflush(f); }
+        else       { n = fread(vm_base + buf, 1, (size_t)size, f); clearerr(f); }
+    }
+    if (pos >= 0) HOST_FSEEK64(f, pos);
+    HOST_UNLOCKFILE(f);
+    { static int n_log = 0;
+      if (getenv("PS3_FSLOG") || PS3_LOG_FIRST(n_log, 8))
+          fprintf(stderr, "[fs] %s with offset fd=%d off=%llu size=%llu -> %zu (lr 0x%08X)\n",
+                  write ? "write" : "read", fd, (unsigned long long)offset,
+                  (unsigned long long)size, n, (uint32_t)ctx->lr); }
+    if (out_ptr) vm_write64(out_ptr, n);
+    ctx->gpr[3] = CELL_OK;
+}
+static void cellFsReadWithOffset(ppu_context* ctx)  { fs_positioned(ctx, 0); }
+static void cellFsWriteWithOffset(ppu_context* ctx) { fs_positioned(ctx, 1); }
+
 extern "C" void ppu_fs_register(void)
 {
     ps3_hle_register_ctx(ps3_compute_nid("cellFsOpen"),     "cellFsOpen",     cellFsOpen);
@@ -956,4 +1110,7 @@ extern "C" void ppu_fs_register(void)
     ps3_hle_register_ctx(0x9F951810u, "cellFsAioFinish", cellFsAioFinish);
     ps3_hle_register_ctx(0xC1C507E7u, "cellFsAioRead",   cellFsAioRead);
     ps3_hle_register_ctx(0x7F13FC8Cu, "cellFsAioCancel", cellFsAioCancel);
+    ps3_hle_register_ctx(0x4CEF342Eu, "cellFsAioWrite",  cellFsAioWrite);
+    ps3_hle_register_ctx(0x0D5B4A14u, "cellFsReadWithOffset",  cellFsReadWithOffset);
+    ps3_hle_register_ctx(0x8CB722D5u, "cellFsWriteWithOffset", cellFsWriteWithOffset);
 }

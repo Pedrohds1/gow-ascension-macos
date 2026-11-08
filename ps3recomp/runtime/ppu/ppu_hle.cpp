@@ -739,8 +739,17 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
-        static int logged = 0;
-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
+        /* Each DISTINCT NID once (plus every 1000th call of it): a global cap of
+         * 40 lines was spent by one NID called 38 times at boot (GoW:A's
+         * cellSpursJoinTask2), and every import missing after that -- the FIOS
+         * AIO write among them -- went unreported. */
+        { static uint32_t seen_nid[256], seen_n[256]; static int n_seen = 0;
+          int k = 0;
+          while (k < n_seen && seen_nid[k] != nid) k++;
+          if (k == n_seen && n_seen < 256) { seen_nid[k] = nid; seen_n[k] = 0; n_seen++; }
+          const uint32_t c = (k < 256) ? ++seen_n[k] : 0;
+          if (c == 1 || (c % 1000) == 0)
+              fprintf(stderr, "[hle] unresolved NID 0x%08X (call %u, lr 0x%08X)\n", nid, c, (uint32_t)ctx->lr); }
         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
          * protocol so it can be implemented. */

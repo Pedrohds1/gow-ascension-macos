@@ -140,6 +140,7 @@ typedef struct {
     u32 depth;                  /* slices of a 3D texture, else 1 */
     u32 levels;                 /* SET_TEXTURE_FORMAT mipmap count it was built with */
     int rewritten;              /* guest bytes rewritten by the engine itself */
+    u32 full_shift;             /* RSX_TEXHASH_ADAPT: full-hash period = FULL_EVERY << this */
 } eng_texture;
 
 typedef struct {
@@ -1196,6 +1197,27 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
     const u8* src = span ? eng_guest_ptr(NULL, location, offset, span) : NULL;
     if (!src) { *readable = 0; return 0; }
     u64 hash = 1469598103934665603ull;
+    if (eng_texhash_lanes()) {
+        /* Four chains over each sampled 64-byte block (two words each), the
+         * next blocks prefetched: the single chain waited on a multiply every
+         * word and on each block's miss in turn. Bijective per lane and in the
+         * fold, like the full hash, so a changed sampled word still always
+         * changes the result. */
+        u64 h1 = hash ^ 0x9E3779B97F4A7C15ull, h2 = hash ^ 0xC2B2AE3D27D4EB4Full,
+            h3 = hash ^ 0x165667B19E3779F9ull;
+        for (u32 i = 0; i + 64 <= span; i += ENG_TEXHASH_STRIDE) {
+            if (i + 4u * ENG_TEXHASH_STRIDE + 64u <= span) __builtin_prefetch(src + i + 4u * ENG_TEXHASH_STRIDE);
+            u64 w[8];
+            memcpy(w, src + i, sizeof w);
+            hash = (hash ^ w[0]) * 1099511628211ull; h1 = (h1 ^ w[1]) * 1099511628211ull;
+            h2 = (h2 ^ w[2]) * 1099511628211ull;     h3 = (h3 ^ w[3]) * 1099511628211ull;
+            hash = (hash ^ w[4]) * 1099511628211ull; h1 = (h1 ^ w[5]) * 1099511628211ull;
+            h2 = (h2 ^ w[6]) * 1099511628211ull;     h3 = (h3 ^ w[7]) * 1099511628211ull;
+        }
+        hash = (hash ^ h1) * 1099511628211ull;
+        hash = (hash ^ h2) * 1099511628211ull;
+        hash = (hash ^ h3) * 1099511628211ull;
+    } else
     for (u32 i = 0; i + 64 <= span; i += ENG_TEXHASH_STRIDE)
         for (u32 k = 0; k < 64; k += 8) {
             u64 word;
@@ -1215,10 +1237,25 @@ static u64 eng_texture_sparse_hash(u32 location, u32 offset, u32 span,
  * hashes of a scene's textures spread over the frames instead of landing on
  * the same one. */
 static int s_texhash_full_always;
-static int eng_texture_full_rehash(u32 span, u32 last_full_frame)
+/* RSX_TEXHASH_ADAPT=<n> (0 = off, the fixed period): a big texture whose full
+ * hash came out unchanged doubles its period, up to FULL_EVERY << n; any
+ * change found sets it back to FULL_EVERY. Most of a scene's textures never
+ * change, and their full hashes were ~1 GB/s of the walker's reads (GoW:A,
+ * Megera). The sparse check still runs every frame, so a texture rewritten
+ * as a whole is still caught at once; only a small write between its sampled
+ * blocks can wait the longer period. */
+static int s_texhash_adapt = -1;
+static u32 eng_texhash_adapt(void)
+{
+    if (s_texhash_adapt < 0) { const char* e = getenv("RSX_TEXHASH_ADAPT"); s_texhash_adapt = e ? atoi(e) : 0;
+                               if (s_texhash_adapt < 0) s_texhash_adapt = 0;
+                               if (s_texhash_adapt > 5) s_texhash_adapt = 5; }
+    return (u32)s_texhash_adapt;
+}
+static int eng_texture_full_rehash(u32 span, u32 last_full_frame, u32 shift)
 {
     return s_texhash_full_always || span <= ENG_TEXHASH_SMALL ||
-           (u32)(g.frames - last_full_frame) >= ENG_TEXHASH_FULL_EVERY;
+           (u32)(g.frames - last_full_frame) >= (ENG_TEXHASH_FULL_EVERY << shift);
 }
 
 static int eng_staging_reserve(u32 bytes)
@@ -1235,6 +1272,18 @@ static int eng_staging_reserve(u32 bytes)
  * the backend. Returns the backend handle, or 0. `into`, when nonzero, is an
  * existing 2D texture of exactly this key to rewrite instead of creating one
  * (rsx_draw_backend.texture_upload_ordered). */
+/* RSX_TEX3D_INPLACE=0: a changed volume gets a new texture and the old one is
+ * released, as before. On, it is rewritten in place like a 2D one -- the uploads
+ * are ordered behind the draws that sampled the old texels the same way -- and
+ * GoW:A's colour-grading LUT, which changes nearly every frame, stops costing a
+ * create and a release (each a wait for the GPU) per change. */
+static int eng_tex3d_inplace(void)
+{
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("RSX_TEX3D_INPLACE"); s = !(e && e[0] == '0'); }
+    return s;
+}
+
 static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                               u32 levels, u32 pitch, int cube, u32 remap, u32 depth,
                               u32 into)
@@ -1245,13 +1294,15 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
     /* A volume: every slice of every level decoded and uploaded on its own.
      * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
      * first slice and sampled in 2D it darkened whole boxes round every prop. */
-    if (!into && depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
+    if (depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
         !lv[0].tl.compressed && lv[0].tl.bytes_per_texel) {
         const u32 span = eng_texture_span_3d(fmt, w, h, depth, levels, pitch);
         const u8* src = eng_guest_ptr(NULL, location, offset, span);
         if (!src) return 0;
-        const u32 handle = g.be->texture_create_3d(g.be->user, eng_texfmt(lv[0].tl.fmt),
-                                                   w, h, depth, nlv, remap, fmt);
+        /* `into`: rewrite an existing volume of this key in place (the cache's
+         * reupload, see eng_tex3d_inplace) instead of a new one per change. */
+        const u32 handle = into ? into
+            : g.be->texture_create_3d(g.be->user, eng_texfmt(lv[0].tl.fmt), w, h, depth, nlv, remap, fmt);
         if (!handle) return 0;
         const u8* level_src = src;
         u32 d = depth;
@@ -1259,7 +1310,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
             const rsx_tex_layout* tl = &lv[m].tl;
             const u32 lin_bytes = tl->swizzled ? tl->row_bytes * tl->rows : 0u;
             if (!eng_staging_reserve(tl->dst_row_bytes * tl->rows + lin_bytes)) {
-                g.be->texture_release(g.be->user, handle);
+                if (!into) g.be->texture_release(g.be->user, handle);
                 return 0;
             }
             for (u32 z = 0; z < d; z++) {
@@ -1374,9 +1425,13 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                 hash = ~e->content_hash;
                 e->rewritten = 0;
             } else if (readable && (sparse != e->sparse_hash ||
-                             eng_texture_full_rehash(span, e->last_full_frame))) {
+                             eng_texture_full_rehash(span, e->last_full_frame, e->full_shift))) {
                 hash = eng_texture_content_hash(location, offset, span, &readable);
                 e->last_full_frame = g.frames;
+                if (readable) {
+                    if (hash != e->content_hash || sparse != e->sparse_hash) e->full_shift = 0;
+                    else if (e->full_shift < eng_texhash_adapt()) e->full_shift++;
+                }
                 if (s_stats_s > 0) {
                     s_st_sub_us[ST_HFULL] += eng_now_us() - st_h0_; s_st_sub_n[ST_HFULL]++;
                     if (span <= ENG_TEXHASH_SMALL) s_pc.full_small++; else s_pc.full_big++;
@@ -1392,8 +1447,9 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                  * that sampled the old bytes; a volume keeps create-and-swap. */
                 /* The key does not hold the mip count: a different one needs a
                  * new image, as the levels to upload would not all exist. */
-                const u32 into = (g.be->texture_upload_ordered && depth <= 1 &&
-                                  e->levels == levels) ? e->handle : 0u;
+                const u32 into = (g.be->texture_upload_ordered && e->levels == levels &&
+                                  (depth <= 1 || (eng_tex3d_inplace() && e->depth == depth)))
+                                     ? e->handle : 0u;
                 const u32 fresh = eng_texture_upload(location, offset, fmt, w, h,
                                                      levels, pitch, cube, remap, depth, into);
                 if (fresh && !into) {
@@ -1468,6 +1524,7 @@ static void eng_textures_touch(u32 location, u32 offset, u32 bytes)
         if (e->location == location && e->offset >= offset && e->offset - offset < bytes) {
             e->last_hash_frame = g.frames - 1u;
             e->last_full_frame = g.frames - ENG_TEXHASH_FULL_EVERY;   /* hash it all */
+            e->full_shift = 0;
             e->rewritten = 1;
         }
     }
@@ -4068,6 +4125,17 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
               if (p) fprintf(s_pd.draws_log, " v0 %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
                              p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
               else fprintf(s_pd.draws_log, " v0 <unresolved>");
+              /* Every other enabled attribute: index, type, size, stride, offset and
+               * the first element's bytes (a wrong format shows as stretched textures). */
+              for (u32 ai = 1; ai < RSX_DSP_NUM_VERTEX_ATTR; ai++) {
+                  rsx_dsp_vertex_attr b; rsx_dsp_get_vertex_attr(&g.rsx, ai, &b);
+                  if (!b.type || !b.size) continue;
+                  fprintf(s_pd.draws_log, " a%u %u/%u/%u@%X", ai, b.type, b.size, b.stride, b.offset);
+                  const u8* r = eng_guest_ptr(NULL, b.location,
+                                              b.offset + rsx_dsp_vertex_data_base_offset(&g.rsx), 8);
+                  if (r) fprintf(s_pd.draws_log, "=%02X%02X%02X%02X%02X%02X%02X%02X",
+                                 r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+              }
               /* Float streams: the first four elements as numbers. */
               if (a.type == 2 && a.stride) {
                   const u8* q = eng_guest_ptr(NULL, a.location,

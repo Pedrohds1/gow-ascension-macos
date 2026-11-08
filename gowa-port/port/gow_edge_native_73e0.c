@@ -91,6 +91,15 @@ static inline v8 g73_key(v8 x)
     return _mm256_sub_epi32(_mm256_xor_si256(mag, neg), neg);
 }
 static inline v8 g73_fcgt(v8 a, v8 b) { return _mm256_cmpgt_epi32(g73_key(a), g73_key(b)); }
+#if defined(__aarch64__) && !defined(__AVX2__)
+/* arm64 (SIMDe): the AVX2 forms below take 8 permutevar8x32 + 8 blendv per call, which SIMDe runs lane
+ * by lane. spu_helpers.h's NEON forms on each half compute the same reference bit for bit. */
+static inline v8 g73_frsqest(v8 x) { return g73_v8(spu_frsqest(g73_lo(x)), spu_frsqest(g73_hi(x))); }
+static inline v8 g73_fi(v8 a, v8 est)
+{
+    return g73_v8(spu_fi(g73_lo(a), g73_lo(est)), spu_fi(g73_hi(a), g73_hi(est)));
+}
+#else
 /* frsqest / fi: spu_helpers.h's AVX2 forms (integer work on the bit fields), eight lanes */
 static inline v8 g73_frsqest(v8 x)
 {
@@ -122,6 +131,7 @@ static inline v8 g73_fi(v8 a, v8 est)
     const v8 zero = _mm256_or_si256(_mm256_cmpeq_epi32(exp, _mm256_setzero_si256()), _mm256_cmpeq_epi32(e2, _mm256_setzero_si256()));
     return _mm256_andnot_si256(zero, r);
 }
+#endif
 
 /* shufb with a loop-invariant control as pshufb (see gow_edge_native.c: built from the control's value
  * exactly as spu_shufb_ref reads it, special selectors included) */

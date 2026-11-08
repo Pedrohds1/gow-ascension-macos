@@ -35,12 +35,15 @@ Frame rate by scene (the game's own frame counter, 50–90 s windows):
 |---|---|
 | Main menu | 60 (locked); ~74 uncapped |
 | Start of the first level | 46–54 |
-| Megaera fight | ~41 |
+| Megaera fight | **~60** (59.9 in A/B; 61.1 in its steady part; 59.7 over 10 minutes) |
 | Bridge / prison area | 42–44 |
 | Rooftop fight (heaviest scene measured) | 22–27 |
 | Harem illusion scene | ~30 (was ~3.6 before translating the EDGE code fragments it uses) |
 
-How the Megaera scene got from unplayable to ~41 fps:
+The Megaera fight was re-measured on 2026-11-08 (fixed window of the fight, headless, interleaved
+A/B). The other scenes are from earlier builds; they have not been re-measured since the work below.
+
+How the Megaera scene got from unplayable to ~60 fps:
 
 | Step | fps |
 |---|---|
@@ -49,6 +52,12 @@ How the Megaera scene got from unplayable to ~41 fps:
 | SPU float in NEON under FPCR round-to-zero + flush-to-zero | 33 |
 | EDGE native kernels via SIMDe where they beat the translated code | 35 |
 | NEON helpers for SPU operations, 3-instruction float range check | ~41 |
+| Main-thread park spin capped to the next vblank tick | 43.7 |
+| Extra SPURS lanes for the job lists the main thread waits on | 50.8 |
+| New textures no longer wait for the GPU; larger draw batches; dense SPU coherence table | ~52 |
+| Live-reservation mirror, lock-line backoff, adaptive texture hash | ~56 |
+| SPU lock-line lock striped by line | 57.6 |
+| Relocatable SPU code copies recognized by content (out of the interpreter); thread-locals cached per SPU context | ~60 |
 
 Shader compilation (the stutter on entering a new area or doing something for the first time):
 
@@ -59,7 +68,9 @@ Shader compilation (the stutter on entering a new area or doing something for th
 | Precompiling the known pipelines at boot | 7.2 s | 0.12 s on the game thread; the rest in the background |
 | Same shader pair in many pipelines | recompiled by Metal each time | one shared module (8.8 → 0.4 ms) |
 
-The game is CPU-bound (SPU work), not GPU-bound: one EDGE job list per frame sets the frame time.
+The game is CPU-bound (SPU work), not GPU-bound. In the Megaera fight the median frame is under
+16.7 ms; the ~14% of frames that run past 20 ms are bound by the EDGE geometry jobs, which the game
+confines to four SPUs.
 
 ## What was built or fixed for macOS
 

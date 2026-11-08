@@ -186,13 +186,64 @@ static struct PmInstance {
     uint32_t ea;
     struct PmSlot slots[SPURS_PM_MAX_WKL][6];
 } s_pm_instances[SPURS_PM_INSTANCES];
+/* The directory lock is taken twice per policy dispatch (thousands a second on
+ * each of six kernel threads) around a few lines of bookkeeping. On Windows an
+ * SRWLOCK spins before it sleeps; win32_compat maps it to a pthread_rwlock on
+ * the Mac, whose contended path parks the thread in the kernel and costs tens
+ * of microseconds to wake: 58% of the SPU threads' samples sat in
+ * __psynch_rw_wrlock under spu_run_policy_module (GoW:A Megaera scene,
+ * 2026-11-08). On Apple Silicon it is a short spinlock instead (spin, then
+ * yield), and the rare retirement wait polls. PM_DIR_SRW=1 keeps the SRWLOCK. */
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <sched.h>
+static volatile int s_pm_dir_spin;
+static int s_pm_dir_srw = -1;
 static SRWLOCK s_pm_directory_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_pm_directory_wake;
+static inline int pm_dir_use_srw(void)
+{
+    if (s_pm_dir_srw < 0) { const char* e = getenv("PM_DIR_SRW"); s_pm_dir_srw = (e && *e == '1'); }
+    return s_pm_dir_srw;
+}
+static inline void pm_dir_lock(void)
+{
+    if (pm_dir_use_srw()) { AcquireSRWLockExclusive(&s_pm_directory_lock); return; }
+    for (;;) {
+        if (!__atomic_exchange_n(&s_pm_dir_spin, 1, __ATOMIC_ACQUIRE)) return;
+        unsigned n = 0;
+        while (__atomic_load_n(&s_pm_dir_spin, __ATOMIC_RELAXED)) {
+            if (++n < 1024) __builtin_arm_yield();
+            else { sched_yield(); n = 0; }
+        }
+    }
+}
+static inline void pm_dir_unlock(void)
+{
+    if (pm_dir_use_srw()) { ReleaseSRWLockExclusive(&s_pm_directory_lock); return; }
+    __atomic_store_n(&s_pm_dir_spin, 0, __ATOMIC_RELEASE);
+}
+static inline void pm_dir_wake(void) { if (pm_dir_use_srw()) WakeAllConditionVariable(&s_pm_directory_wake); }
+static inline void pm_dir_wait(void)
+{
+    if (pm_dir_use_srw()) { SleepConditionVariableSRW(&s_pm_directory_wake, &s_pm_directory_lock, INFINITE, 0); return; }
+    pm_dir_unlock(); usleep(200); pm_dir_lock();
+}
+#else
+static SRWLOCK s_pm_directory_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_pm_directory_wake;
+static inline void pm_dir_lock(void)   { AcquireSRWLockExclusive(&s_pm_directory_lock); }
+static inline void pm_dir_unlock(void) { ReleaseSRWLockExclusive(&s_pm_directory_lock); }
+static inline void pm_dir_wake(void)   { WakeAllConditionVariable(&s_pm_directory_wake); }
+static inline void pm_dir_wait(void)
+{
+    SleepConditionVariableSRW(&s_pm_directory_wake, &s_pm_directory_lock, INFINITE, 0);
+}
+#endif
 static struct PmSlot* policy_slot(uint32_t ea, uint32_t wid, uint32_t lane)
 {
     struct PmInstance* free_slot = NULL;
     struct PmSlot* slot = NULL;
-    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    pm_dir_lock();
     for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
         struct PmInstance* pi = &s_pm_instances[i];
         if (pi->used && pi->ea == ea) {
@@ -212,7 +263,7 @@ static struct PmSlot* policy_slot(uint32_t ea, uint32_t wid, uint32_t lane)
                 slot->owner->users++;slot->owner->workload_users[wid]++; break;
             }
     }
-    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    pm_dir_unlock();
     if (slot) AcquireSRWLockExclusive(&slot->lock);
     return slot;
 }
@@ -220,10 +271,10 @@ static struct PmSlot* policy_slot(uint32_t ea, uint32_t wid, uint32_t lane)
 static void policy_slot_release(struct PmSlot* slot)
 {
     ReleaseSRWLockExclusive(&slot->lock);
-    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    pm_dir_lock();
     slot->owner->users--;slot->owner->workload_users[slot->wid]--;
-    WakeAllConditionVariable(&s_pm_directory_wake);
-    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    pm_dir_wake();
+    pm_dir_unlock();
 }
 
 /* Quiescent workload removal must retire its incarnation even when the next
@@ -232,12 +283,12 @@ static void policy_slot_release(struct PmSlot* slot)
 int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
 {
     if (wid >= SPURS_PM_MAX_WKL) return -1;
-    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    pm_dir_lock();
     for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
         struct PmInstance* pi = &s_pm_instances[i];
         if (!pi->used || pi->ea != ea) continue;
         if (pi->retiring || pi->workload_users[wid]) {
-            ReleaseSRWLockExclusive(&s_pm_directory_lock); return -1;
+            pm_dir_unlock(); return -1;
         }
         for (unsigned n = 0; n < 6; n++) {
             struct PmSlot* slot = &pi->slots[wid][n];
@@ -250,7 +301,7 @@ int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
         }
         break;
     }
-    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    pm_dir_unlock();
     return 0;
 }
 
@@ -259,14 +310,14 @@ int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
  * Keep the zero-initialized lock objects valid when the directory slot recurs. */
 void spurs_policy_release_instance(uint32_t ea)
 {
-    AcquireSRWLockExclusive(&s_pm_directory_lock);
+    pm_dir_lock();
     for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
         struct PmInstance* pi = &s_pm_instances[i];
         if (!pi->used || pi->ea != ea) continue;
         if (pi->retiring) break;
         pi->retiring = 1;
         while (pi->users)
-            SleepConditionVariableSRW(&s_pm_directory_wake, &s_pm_directory_lock, INFINITE, 0);
+            pm_dir_wait();
         for (unsigned w = 0; w < SPURS_PM_MAX_WKL; w++) for (unsigned n = 0; n < 6; n++) {
             struct PmSlot* slot = &pi->slots[w][n];
             AcquireSRWLockExclusive(&slot->lock);
@@ -282,7 +333,7 @@ void spurs_policy_release_instance(uint32_t ea)
         pi->used = 0; pi->retiring = 0; pi->ea = 0;
         break;
     }
-    ReleaseSRWLockExclusive(&s_pm_directory_lock);
+    pm_dir_unlock();
 }
 
 /* PS3_FTRACE "who" for a host kernel thread: numbered in first-use order. */
@@ -476,7 +527,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
-    { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_spurs_pm_t0 = (unsigned long long)q.QuadPart; }
+    /* The run's start, for SPURS_PM_POLL_SLICE_US only: a clock read per module
+     * run (~100k a second) otherwise. */
+    { static int s_sl = -1;
+      if (s_sl < 0) s_sl = getenv("SPURS_PM_POLL_SLICE_US") ? 1 : 0;
+      if (s_sl) { LARGE_INTEGER q; QueryPerformanceCounter(&q); g_spurs_pm_t0 = (unsigned long long)q.QuadPart; } }
 
     /* RUN/END tracing: thousands of policy dispatches per second made these
      * unconditional fprintf+fflush pairs a real fraction of movie playback.

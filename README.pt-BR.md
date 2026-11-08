@@ -36,12 +36,16 @@ fps por cena, pelo contador de quadros do próprio jogo, em janelas de 50–90 s
 |---|---|
 | Menu principal | 60 (travado); ~74 destravado |
 | Início do primeiro nível | 46–54 |
-| Luta com a Megera | ~41 |
+| Luta com a Megera | **~60** (59,9 no A/B; 61,1 no trecho estável; 59,7 em 10 minutos) |
 | Ponte / área da prisão | 42–44 |
 | Luta no telhado (a cena mais pesada medida) | 22–27 |
 | Cena da ilusão do harém | ~30 (era ~3,6 antes de traduzir os fragmentos EDGE que ela usa) |
 
-Como a cena da Megera foi de injogável a ~41 fps:
+A luta com a Megera foi medida de novo em 08/11/2026 (janela fixa da luta, sem janela, A/B
+intercalado). As outras cenas são de builds anteriores e ainda não foram medidas depois do
+trabalho abaixo.
+
+Como a cena da Megera foi de injogável a ~60 fps:
 
 | Etapa | fps |
 |---|---|
@@ -50,6 +54,12 @@ Como a cena da Megera foi de injogável a ~41 fps:
 | Float das SPUs em NEON com FPCR em arredondamento para zero + flush-to-zero | 33 |
 | Nativos EDGE via SIMDe onde vencem o código traduzido | 35 |
 | Auxiliares NEON para operações das SPUs, checagem de faixa do float em 3 instruções | ~41 |
+| Giro da thread principal no park limitado ao próximo tique de vblank | 43,7 |
+| Lanes extras do SPURS para as listas de jobs que a thread principal espera | 50,8 |
+| Texturas novas sem esperar a GPU; lotes de desenho maiores; tabela densa na coerência das SPUs | ~52 |
+| Espelho das reservas vivas, recuo na trava de lock-line, hash de textura adaptativo | ~56 |
+| Trava de lock-line das SPUs dividida por linha | 57,6 |
+| Cópias de código relocável das SPUs reconhecidas pelo conteúdo (fora do interpretador); variáveis por thread guardadas no contexto da SPU | ~60 |
 
 Compilação de shaders (as travadas ao entrar numa área nova ou fazer algo pela primeira vez):
 
@@ -60,8 +70,9 @@ Compilação de shaders (as travadas ao entrar numa área nova ou fazer algo pel
 | Pré-compilação dos pipelines conhecidos na abertura | 7,2 s | 0,12 s na thread do jogo; o resto em segundo plano |
 | Mesmo par de shaders em vários pipelines | recompilado pelo Metal a cada um | um módulo compartilhado (8,8 → 0,4 ms) |
 
-O jogo é limitado pela CPU (trabalho das SPUs), não pela GPU: uma lista de jobs EDGE por quadro
-dita o tempo do quadro.
+O jogo é limitado pela CPU (trabalho das SPUs), não pela GPU. Na luta com a Megera o quadro mediano
+fica abaixo de 16,7 ms; os ~14% de quadros acima de 20 ms são limitados pelos jobs de geometria do
+EDGE, que o jogo restringe a quatro SPUs.
 
 ## O que foi feito ou corrigido para o macOS
 

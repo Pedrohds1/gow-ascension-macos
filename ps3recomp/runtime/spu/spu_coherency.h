@@ -42,6 +42,15 @@ extern "C" {
  * reserved. The critical sections are two 128-byte memcpy and a memcmp. */
 void spu_lockline_lock(void);
 void spu_lockline_unlock(void);
+/* SPU_LOCKLINE_STRIPES=<n>: the lock is n stripes by line, and the call above
+ * takes them all. A transaction on one line takes only that line's stripe;
+ * a block, the stripes of its lines in ascending order. With one stripe (the
+ * default) every form is the one lock. */
+void spu_lockline_lock_line(uint32_t ea);
+void spu_lockline_unlock_line(uint32_t ea);
+void spu_lockline_lock_span(uint32_t ea, uint32_t size);
+void spu_lockline_unlock_span(uint32_t ea, uint32_t size);
+int  spu_lockline_striped(void);
 
 /* Mark `ea`'s 128-byte line as SPU-reserved and remember `ctx` as a possible
  * reservation holder. Called from the SPU's GETLLAR with the lock held.
@@ -68,6 +77,12 @@ int spu_coh_is_reserved(uint32_t addr);
  * Expects the lock-line lock held, so that the store this is reporting and the
  * reservation state it clears are seen by an SPU's PUTLLC as one transaction. */
 void spu_coh_notify_write(uint32_t ea);
+/* The holder table's per-slot mirror of each context's reservation (see
+ * spu_coherency.c). _set right after storing resv_valid = (line | 1), before
+ * the fence that publishes it; _clear when the context ends its own
+ * reservation (PUTLLC, PUTLLUC, a lost-reservation poll). */
+void spu_coh_mirror_set(spu_context* ctx, uint32_t ea);
+void spu_coh_mirror_clear(spu_context* ctx);
 /* Remove a context from the reserving set. MUST be called before a
  * transient (stack-allocated) spu_context goes out of scope. */
 void spu_coh_unregister(spu_context* ctx);

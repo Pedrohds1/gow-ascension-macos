@@ -34,6 +34,23 @@ mkdir -p "$save/hdd0" "$save/hdd1" "$save/gamedata" "$here/work/spirv-cache"
 fps=""
 [ -n "$ALTO_FPS" ] && fps="GOW_VBLANK_MS=8 GOW_POKE=905D30,78;81AF14,42EFC28F"
 
+# Cache de disco da FIOS (hdd1): um bloco estragado nele quebrou a cena do Orkos em toda
+# sessão (2026-11-08). Depois de cada sessão, um vigia confere cada bloco contra o disco e
+# conserta o que estiver errado (scripts/cache_fios.py, log em saves/jogador/cache_fios.log).
+# Se a conferência anterior ainda roda, espera ela terminar antes de abrir o jogo.
+trava="$save/.cache_fios.pid"
+if [ -f "$trava" ] && kill -0 "$(cat "$trava" 2>/dev/null)" 2>/dev/null; then
+    echo "conferindo o cache da sessão anterior; o jogo abre em seguida..."
+    while kill -0 "$(cat "$trava" 2>/dev/null)" 2>/dev/null; do sleep 1; done
+fi
+if [ -z "$SEM_CONFERIR_CACHE" ] && [ -x "$here/.venv/bin/python" ]; then
+    jogo=$$
+    nohup sh -c "while kill -0 $jogo 2>/dev/null; do sleep 5; done
+        echo \$\$ > '$trava'
+        nice -n 15 '$here/.venv/bin/python' -I '$here/scripts/cache_fios.py' '$save' --consertar > '$save/cache_fios.log' 2>&1
+        rm -f '$trava'" >/dev/null 2>&1 &
+fi
+
 cd "$save" || exit 1
 exec env PS3_VFS_ROOT="$here/work/disc" PS3_HDD0_ROOT="$save/hdd0" PS3_HDD1_ROOT="$save/hdd1" \
     PS3_GAMEDATA_ROOT="$save/gamedata" \

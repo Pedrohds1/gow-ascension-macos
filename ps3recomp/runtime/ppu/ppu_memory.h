@@ -136,6 +136,10 @@ void        ppu_resv_break_store(uint64_t ea);
 int         spu_coh_is_reserved(uint32_t addr);
 void        spu_lockline_lock(void);
 void        spu_lockline_unlock(void);
+void        spu_lockline_lock_line(uint32_t addr);   /* one line's stripe */
+void        spu_lockline_unlock_line(uint32_t addr);
+void        spu_lockline_lock_span(uint32_t addr, uint32_t size);
+void        spu_lockline_unlock_span(uint32_t addr, uint32_t size);
 void        spu_coh_notify_write(uint32_t addr);
 #ifdef __cplusplus
 }
@@ -144,10 +148,10 @@ void        spu_coh_notify_write(uint32_t addr);
 #define VM_WRITE_COH(addr, src, n)                                            \
     do {                                                                      \
         if (spu_coh_line_reserved((uint32_t)(addr))) {                        \
-            spu_lockline_lock();                                              \
+            spu_lockline_lock_span((uint32_t)(addr), (uint32_t)(n));          \
             memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
             spu_coh_notify_write((uint32_t)(addr));                           \
-            spu_lockline_unlock();                                            \
+            spu_lockline_unlock_span((uint32_t)(addr), (uint32_t)(n));        \
         } else {                                                              \
             memcpy(vm_ptr8((uint32_t)(addr)), (src), (n));                    \
         }                                                                     \
@@ -257,10 +261,10 @@ static inline void vm_block_notify(uint32_t guest_dst, size_t len)
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
     if (vm_block_reserved(guest_dst, len)) {
-        spu_lockline_lock();
+        spu_lockline_lock_span(guest_dst, (uint32_t)len);
         memcpy(vm_ptr8(guest_dst), host_src, len);
         vm_block_notify(guest_dst, len);
-        spu_lockline_unlock();
+        spu_lockline_unlock_span(guest_dst, (uint32_t)len);
     } else {
         memcpy(vm_ptr8(guest_dst), host_src, len);
     }
@@ -269,10 +273,10 @@ static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t
 static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
 {
     if (vm_block_reserved(guest_dst, len)) {
-        spu_lockline_lock();
+        spu_lockline_lock_span(guest_dst, (uint32_t)len);
         memset(vm_ptr8(guest_dst), val, len);
         vm_block_notify(guest_dst, len);
-        spu_lockline_unlock();
+        spu_lockline_unlock_span(guest_dst, (uint32_t)len);
     } else {
         memset(vm_ptr8(guest_dst), val, len);
     }
@@ -322,12 +326,12 @@ static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
      * reverse), and the reserving SPU gets its lost-reservation event. */
     int ok;
     if (spu_coh_is_reserved(addr)) {
-        spu_lockline_lock();
+        spu_lockline_lock_line(addr);
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,
             memory_order_acq_rel, memory_order_acquire);
         if (ok) spu_coh_notify_write(addr);
-        spu_lockline_unlock();
+        spu_lockline_unlock_line(addr);
     } else {
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,
@@ -371,12 +375,12 @@ static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
 
     int ok;
     if (spu_coh_is_reserved(addr)) {
-        spu_lockline_lock();
+        spu_lockline_lock_line(addr);
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,
             memory_order_acq_rel, memory_order_acquire);
         if (ok) spu_coh_notify_write(addr);
-        spu_lockline_unlock();
+        spu_lockline_unlock_line(addr);
     } else {
         ok = atomic_compare_exchange_strong_explicit(
             atom, &expected, desired,

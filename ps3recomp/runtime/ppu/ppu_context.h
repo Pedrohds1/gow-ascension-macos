@@ -91,9 +91,18 @@ typedef struct ppu_context {
     uint64_t thread_id;
 
     /* Reserve address for lwarx/stwcx (load-linked / store-conditional) */
+    /* reserve_* on a cache line of their own (a full line of padding on both
+     * sides, whatever the context's alignment): every write to a line an SPU
+     * has reserved scans reserve_addr in every registered context
+     * (ppu_resv_break_line, 0.7-1.9 us a notify in GoW:A), and next to
+     * cr/xer/lr -- written all the time by the running thread -- each read
+     * missed and took that line away from its owner. The generated header
+     * (tools/ppu_lifter.py) carries the same layout: change both together. */
+    char     resv_pad0[128];
     uint64_t reserve_addr;
     uint64_t reserve_value;
     int      reserve_valid;
+    char     resv_pad1[128];
 
     /* VRSAVE (SPR 256): software-managed; kept so mfspr returns what mtspr wrote */
     uint32_t vrsave;

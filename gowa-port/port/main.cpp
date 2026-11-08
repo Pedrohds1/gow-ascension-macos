@@ -331,8 +331,71 @@ static int s_main_owns_window = 0;
 static int s_main_rsx_ok = 0;
 static volatile int s_main_window_closed = 0;
 
+/* GOW_EARLY_VBL=1 (macOS): give the vblank as soon as a frame segment is queued
+ * and 1/60 s has passed since the last one was released, instead of on the next
+ * fixed tick. GoW:A's vblank handler (func_00376DE8) does nothing but release
+ * the oldest queued segment -- it patches that segment's self-JUMP park and
+ * advances the read index at 0x9711D8 (write index 0x9711D4, 32 entries); its
+ * counter is reset by every release and its threshold (0x970F30) is 0 -- and
+ * the title imports no vblank-count reader. So the beat only decides when the
+ * RSX may start each frame: with a fixed 60 Hz beat a frame that misses it
+ * waits up to a whole period, which is what GOW_VBLANK_MS=8 (with the game's
+ * rate pokes) bought back. Here the release waits only for the 1/60 s cap,
+ * which keeps the frame rate at or below 60 with the game's own timing. */
+#if defined(__APPLE__)
+static int s_early_vbl = -1;
+static uint32_t s_ev_last_rd = 0xFFFFFFFFu;
+static uint64_t s_ev_last_rel, s_ev_last_kick;
+static uint64_t ev_now_us(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000u;
+}
+static inline uint32_t ev_be32(uint32_t ea)
+{
+    const uint8_t* p = vm_base + ea;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static int early_vbl_on(void)
+{
+    if (s_early_vbl < 0) {
+        const char* e = getenv("GOW_EARLY_VBL");
+        s_early_vbl = (e && atoi(e) > 0) ? 1 : 0;
+        if (s_early_vbl) fprintf(stderr, "[boot] GOW_EARLY_VBL: vblank as soon as a frame segment waits (60/s cap)\n");
+    }
+    return s_early_vbl && vm_base;
+}
+/* take = 1: the caller gives the vblank now (no second one for 2 ms while the
+ * handler is being delivered). */
+static int early_vbl_due(int take)
+{
+    if (!early_vbl_on()) return 0;
+    const uint32_t rd = ev_be32(0x9711D8u), wr = ev_be32(0x9711D4u);
+    const uint64_t now = ev_now_us();
+    if (rd != s_ev_last_rd) { s_ev_last_rd = rd; s_ev_last_rel = now; }
+    if (rd == wr || rd > 31u || wr > 31u) return 0;
+    if (now - s_ev_last_rel < 16667u || now - s_ev_last_kick < 2000u) return 0;
+    if (take) s_ev_last_kick = now;
+    return 1;
+}
+#else
+static int early_vbl_on(void) { return 0; }
+static int early_vbl_due(int) { return 0; }
+#endif
+
 static DWORD WINAPI frame_clock(LPVOID)
 {
+#ifdef __APPLE__
+    /* GOW_WALKER_QOS=ui|init: the QoS of this thread alone -- it runs the RSX walker,
+     * and QoS is what keeps a thread on the performance cores when they are busy.
+     * GOW_QOS sets every thread's. */
+    if (const char* q = getenv("GOW_WALKER_QOS")) {
+        qos_class_t c = !strcmp(q, "ui") ? QOS_CLASS_USER_INTERACTIVE :
+                        !strcmp(q, "init") ? QOS_CLASS_USER_INITIATED : QOS_CLASS_DEFAULT;
+        pthread_set_qos_class_self_np(c, 0);
+        fprintf(stderr, "[boot] GOW_WALKER_QOS=%s\n", q);
+    }
+#endif
     { const char* m = getenv("GOW_MAIN_PROF");
       if (m && atoi(m) > 0) CreateThread(NULL, 0, main_prof, (LPVOID)(uintptr_t)(atoi(m) * 1000), 0, NULL); }
     { const char* w = getenv("GOW_CLOCK_WATCH");
@@ -358,12 +421,55 @@ static DWORD WINAPI frame_clock(LPVOID)
          * a self-JUMP park, yield-poll that word instead of sleeping the tick, so
          * the walker follows each EDGE segment patch at once (the first level ran
          * at ~1 frame/s on 4 ms naps per hole). */
-        { static int s_ps = -1;
+        /* Neither the park spin nor the idle nap may run past the next vblank
+         * tick: GoW:A's vblank handler is what releases the next frame's park
+         * (it patches the self-JUMP), so a spin that waited out its 4 ms for a
+         * release that needs the tick delayed every frame's release by up to
+         * 4 ms. GCM_PARK_TICK_CAP=0 restores the fixed spin/nap. */
+        { static int s_ps = -1, s_cap = -1;
           if (s_ps < 0) { const char* e = getenv("GCM_PARK_SPIN_US"); s_ps = e ? atoi(e) : 4000; }
-          if (s_ps <= 0 || cellGcm_park_spin((unsigned)s_ps) < 0) Sleep(4); }
+          if (s_cap < 0) { const char* e = getenv("GCM_PARK_TICK_CAP"); s_cap = !(e && *e == '0'); }
+          unsigned spin_us = (unsigned)(s_ps > 0 ? s_ps : 0), nap_ms = 4;
+          if (s_cap) {
+              const long long rem = (long long)(next_tick - GetTickCount64());
+              const unsigned rem_ms = rem > 0 ? (unsigned)rem : 0u;
+              if (spin_us > rem_ms * 1000u) spin_us = rem_ms * 1000u;
+              if (nap_ms > rem_ms) nap_ms = rem_ms;
+          }
+          if (early_vbl_on()) {
+              /* The same spin or nap in 250 us slices, so a segment queued
+               * meanwhile is released (below) without waiting them out. */
+              unsigned left = 0; int parked = s_ps > 0;
+              if (parked) { const int r = cellGcm_park_spin(1u); if (r != 0) parked = 0, left = r > 0 ? 0u : nap_ms * 1000u;
+                            else left = spin_us; }
+              else left = nap_ms * 1000u;
+              while (left && !early_vbl_due(0)) {
+                  const unsigned step = left < 250u ? left : 250u;
+                  if (parked) { if (cellGcm_park_spin(step) != 0) break; }
+                  else usleep(step);
+                  left -= step;
+              }
+          }
+          else if (s_ps <= 0) { if (nap_ms) Sleep(nap_ms); }
+          else if (spin_us == 0) { if (cellGcm_park_spin(1u) < 0 && nap_ms) Sleep(nap_ms); }
+          else if (cellGcm_park_spin(spin_us) < 0 && nap_ms) Sleep(nap_ms); }
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;
+        if (early_vbl_due(1)) {
+            CLOCK_PHASE(1);
+            cellGcmTickVBlank();
+            CLOCK_PHASE(2);
+            cellGcmTickFlip();
+            if (rsx_ok && cellGcm_take_flip_pending()) {
+                CLOCK_PHASE(3);
+                present_guest_frame();
+                last_flip = cellGcm_flip_request_count();
+            }
+            CLOCK_PHASE(4);
+            if (rsx_ok) cellGcm_rsx_process_fifo();
+            next_tick = now + 17u;   /* the fixed beat resumes a full period after it */
+        }
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
             CLOCK_PHASE(1);
             cellGcmTickVBlank();
@@ -755,8 +861,16 @@ int main(int argc, char** argv)
     /* arm64 (M4 Max, 10 performance cores): four EDGE lanes, every SPU the EDGE workloads have
      * a priority on (0-3, so each lane still has its own output ring). The frame is one EDGE
      * list at a time running 2-2.75 lanes wide; the level checkpoint went 23.1/22.7 -> 24.8/25.9
-     * game frames/s (alternated), the Megera scene (not EDGE-bound) unchanged, frames clean. */
-    if (!getenv("SPURS_LANES")) _putenv_s("SPURS_LANES", "15,16,17=4;3,7=3");
+     * game frames/s (alternated), the Megera scene (not EDGE-bound) unchanged, frames clean.
+     * 2026-11-08: the main thread's frame is mostly waits for WWS job lists, and General6 sat
+     * at its 3-lane cap 68% of the time while the RenJobSet lists (9-12) and RenderJobs (13)
+     * ran one lane wide right before the flip. Lanes for every list the main thread waits on,
+     * on the SPUs the game gave it a priority on (WWS keeps a sync row per SPU and puts
+     * cross-lane barriers in its lists): Megera fight, Kratos idle, t=115-190 s, game frames/s
+     * 43.6/43.8 (old) -> 47.2/46.9 (3,7=5;9-12=3) -> 50.8/50.5 (same + 0,13=3) and 50.8 with
+     * CollisL (0) left at one lane (this): 0.3 ms a frame, and a race in collision would be a
+     * gameplay bug, not a visual one. A/B, frames clean. */
+    if (!getenv("SPURS_LANES")) _putenv_s("SPURS_LANES", "15,16,17=4;2,3,7,9,10,11,12,14=6;13=3");
 #endif
     if (!getenv("SPURS_LANES")) _putenv_s("SPURS_LANES", "15,16,17=3;3,7=3");
     /* PS3_VERBOSE=0: the per-event [WAIT]/[evt] lines default ON whenever stderr is
@@ -780,6 +894,12 @@ int main(int argc, char** argv)
      * lists run back to back on four kernel threads (below) it pays: tail 1.590/
      * 1.523/1.525/1.512 vs 1.502/1.435/1.456/1.415 (swapped 2+2), no hang. */
     if (!getenv("VK_ASYNC")) _putenv_s("VK_ASYNC", "1");
+#if defined(__aarch64__)
+    /* VK_DRAW_BATCH_MAX=512 (arm64): with VK_ASYNC each batch opens with a full barrier,
+     * and 128 draws a batch made ~16 of them a frame. Megera fight, v6, A/B (two rounds):
+     * 51.5/51.8 game frames/s at 128, 51.7/52.3 at 256, 52.4/52.2 at 512. */
+    if (!getenv("VK_DRAW_BATCH_MAX")) _putenv_s("VK_DRAW_BATCH_MAX", "512");
+#endif
     /* VK_PASS_MERGE=1 and RSX_REMAP_RANGE=1 (M0.89): a batched draw keeps its
      * render pass open for the next compatible one, and a dense indexed draw
      * takes its vertex id range instead of deduplicating references. In the
@@ -833,6 +953,20 @@ int main(int argc, char** argv)
      * draw's whole state; they reuse its resolved targets, textures and constant
      * buffers (exact: =2 check, 0 differ). Walker CPU per draw -2-3%. */
     if (!getenv("RSX_DRAW_REPEAT")) _putenv_s("RSX_DRAW_REPEAT", "1");
+    /* RSX_TEXHASH_ADAPT=3 (2026-11-08): a big texture whose full hash came out unchanged
+     * doubles its full-hash period up to 8<<3 frames; any change found sets it back to 8.
+     * The sparse check still runs every frame, so a texture rewritten as a whole is still
+     * caught at once. Megera fight, A/B three rounds: 54.8/54.8/55.5 -> 56.3/55.4/56.1 game
+     * frames/s, frames clean. RSX_TEXHASH_ADAPT=0 keeps the fixed period of 8. */
+    if (!getenv("RSX_TEXHASH_ADAPT")) _putenv_s("RSX_TEXHASH_ADAPT", "3");
+    /* SPU_LOCKLINE_STRIPES=16 (2026-11-08): the lock-line lock striped by line (spu_coherency.c).
+     * With the SPURS lanes it was the hottest function on the EDGE threads and ~4% of the main
+     * thread; nearly every holder touches one line, and the hot lines (the main thread's list at
+     * 0x970F00/0x970F80, the three EDGE list lines, ...) no longer queue behind each other.
+     * Megera fight, A/B three rounds: 54.9/55.3/55.7 -> 57.9/57.5/57.5 game frames/s (steady
+     * 55.8/56.0/55.6 -> 58.0/57.7/57.8),
+     * frames clean; stress test exact at 1/2/4/16/64 stripes. SPU_LOCKLINE_STRIPES=1 goes back. */
+    if (!getenv("SPU_LOCKLINE_STRIPES")) _putenv_s("SPU_LOCKLINE_STRIPES", "16");
     if (!getenv("VK_CB_REUSE")) _putenv_s("VK_CB_REUSE", "1");
     /* RSX_Z2ARGB=1: the 1280x720 depth target the deferred passes sample as
      * A8R8G8B8 (twice per frame) is built on the GPU instead of being stored to

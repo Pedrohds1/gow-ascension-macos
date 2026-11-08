@@ -233,6 +233,7 @@ int spu_jobrep_atomic(spu_context* ctx, uint32_t cmd, uint32_t ea, uint32_t lsa)
         memcpy(ls, e + 1, 128);
         memcpy(ctx->resv_line, e + 1, 128);
         ctx->resv_ea = ea; ctx->resv_valid = (int)((ea & ~127u) | 1u); ctx->atomic_stat = 4;
+        { extern void spu_coh_mirror_set(spu_context*, uint32_t); spu_coh_mirror_set(ctx, ea); }
         ctx->dbg_getllar++;
     } else {
         jr_cmp_output(s, e, ls, 128);
@@ -435,6 +436,7 @@ static void jr_load(spu_context* ctx, const spu_jobcap_header* h, const uint8_t*
     ctx->mfc_size = st->mfc_size; ctx->mfc_tag = st->mfc_tag;
     ctx->mfc_tag_mask = st->mfc_tag_mask; ctx->mfc_tag_status = st->mfc_tag_status;
     ctx->resv_ea = st->resv_ea; ctx->resv_valid = (int)st->resv_valid; ctx->atomic_stat = st->atomic_stat;
+    if (ctx->resv_valid) { extern void spu_coh_mirror_set(spu_context*, uint32_t); spu_coh_mirror_set(ctx, ctx->resv_ea); }
     ctx->list_stall_mask = st->list_stall_mask; ctx->list_stall_stat = st->list_stall_stat;
     ctx->irq_resume_pc = st->irq_resume_pc;   /* irq_saved: spu_run_with_halt forgets it anyway */
     ctx->module_img_a00 = st->module_img_a00;

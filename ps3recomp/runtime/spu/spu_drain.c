@@ -60,14 +60,39 @@ void* volatile    g_pm_flow_ctx = 0;
 extern void spu_halt(spu_context*);
 /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
  * ended where it should not have (spurs_policy.c, [pm-end]). */
-static _Thread_local uint32_t t_recent[32];
-static _Thread_local uint32_t t_recent_n;
+typedef struct { uint32_t pc[32]; uint32_t n; } spu_recent_ring;
+static _Thread_local spu_recent_ring t_recent;
 unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 {
-    unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
-    for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
+    unsigned n = t_recent.n < 32 ? t_recent.n : 32, k = n < max ? n : max;
+    for (unsigned i = 0; i < k; i++) out[i] = t_recent.pc[(t_recent.n - k + i) & 31];
     return k;
 }
+#if SPU_TLS_CACHE
+/* spu_context.h: this thread's pointers for ctx, and the stack they hold for. */
+#include <pthread.h>
+void spu_tls_refresh(spu_context* ctx)
+{
+    extern void* spu_ibc_tls(void);   /* spu_channels.c */
+    pthread_t self = pthread_self();
+    const uintptr_t hi = (uintptr_t)pthread_get_stackaddr_np(self);
+    const uintptr_t sz = (uintptr_t)pthread_get_stacksize_np(self);
+    uintptr_t sp;
+#if defined(__aarch64__)
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+#else
+    sp = (uintptr_t)__builtin_frame_address(0);
+#endif
+    ctx->tls_tramp = &g_spu_trampoline_fn;
+    ctx->tls_ibc = spu_ibc_tls();
+    ctx->tls_recent = &t_recent;
+    if (sz && sp < hi && sp >= hi - sz) { ctx->tls_stk_lo = hi - sz; ctx->tls_stk_sz = sz; }
+    else { ctx->tls_stk_lo = 0; ctx->tls_stk_sz = 0; }   /* a stack we cannot bound: check again each time */
+}
+#define SPU_RECENT(ctx) ((spu_recent_ring*)(ctx)->tls_recent)   /* after spu_tls_check */
+#else
+#define SPU_RECENT(ctx) (&t_recent)
+#endif
 
 static void spu_job_ls0_note(const spu_context* ctx)
 {
@@ -107,7 +132,7 @@ void spu_direct_init(void)
 
 void spu_task_launch_check(spu_context* ctx, void* fn)
 {
-    t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
+    t_recent.pc[t_recent.n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
     spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
     /* A SPURS job returning to LS 0 is finished -- its crt tail-jumps to the
@@ -199,10 +224,7 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
  * adopted inside the callee cannot leak into the caller's continuation. A
  * persistent LS-0xA00 workload module (module_img_a00) is re-applied since the
  * plain restore would undo it. */
-void spu_img_restore(spu_context* ctx, int32_t saved_img)
-{
-    ctx->image_id = ctx->module_img_a00 ? ctx->module_img_a00 : saved_img;
-}
+/* spu_img_restore is inline in spu_context.h. */
 
 /* spu_ch_wake now has its real body in spu_channels.c (milestone 3). */
 
@@ -435,11 +457,15 @@ void (*spu_take_interrupt(spu_context* ctx,
 
 /* See the declaration in spu_context.h. */
 static uint32_t s_depth_max;   /* SPU_HOST_DEPTH_MAX, 0 until read */
+/* The same limit for the inline fast path of spu_drain_call (spu_context.h):
+ * 0 until read, so the first call takes the full path and reads it. */
+uint32_t g_spu_drain_depth_max = 0;
 void spu_depth_guard(spu_context* ctx)
 {
     if (!s_depth_max) {
         const char* e = getenv("SPU_HOST_DEPTH_MAX");
         s_depth_max = e ? (uint32_t)strtoul(e, 0, 0) : 2000u;
+        g_spu_drain_depth_max = s_depth_max;
     }
     if (ctx->host_depth < s_depth_max) return;
     static int s_reported = 0;
@@ -517,7 +543,7 @@ static inline void spu_hop(spu_context* ctx, void (*fn)(spu_context*))
     }
     /* What spu_task_launch_check does with every switch off. */
     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
-    t_recent[t_recent_n++ & 31] = pc;
+    { spu_recent_ring* r_ = SPU_RECENT(ctx); r_->pc[r_->n++ & 31] = pc; }
     if (g_spu_stack_reset_count)
         spu_check_stack_reset(ctx, fn);
     if (ctx->steps++ && pc == 0 && !ctx->policy_mode && ctx->image_id > 0) {
@@ -531,11 +557,16 @@ static inline void spu_hop(spu_context* ctx, void (*fn)(spu_context*))
 
 void spu_drain_hop(spu_context* ctx, void (*fn)(spu_context*))
 {
+    spu_tls_check(ctx);   /* spu_hop reads the cached ring */
     spu_hop(ctx, fn);
 }
 
-void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+void spu_drain_call_slow(spu_context* ctx, uint32_t return_pc)
 {
+    /* This thread's pending transfer, through the context's cache (one stack
+     * check instead of a _tlv_get_addr call); also validates the cached ring
+     * of recent pcs spu_hop writes. */
+    void (**const tr)(spu_context*) = spu_tramp_slot(ctx);
     if (__builtin_expect(g_spu_direct < 0, 0)) spu_direct_init();
     if (__builtin_expect(ctx->host_depth >= s_depth_max, 0))
         spu_depth_guard(ctx);
@@ -551,16 +582,16 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
     f.prev = 0; f.depth = 0; f.image_id = 0;
 #define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
     for (;;) {
-        while (g_spu_trampoline_fn) {
-            if (g_spu_trampoline_fn == spu_indirect_branch &&
+        while ((*tr)) {
+            if ((*tr) == spu_indirect_branch &&
                 (ctx->pc & SPU_LS_MASK) == (return_pc & SPU_LS_MASK)) {
-                g_spu_trampoline_fn = 0;
+                (*tr) = 0;
                 SPU_DRAIN_POP_IRQ();
                 if (g_spu_jobret_on) spu_job_drain_return(ctx, return_pc);
                 return;
             }
-            void (*fn)(spu_context*) = g_spu_trampoline_fn;
-            g_spu_trampoline_fn = 0;
+            void (*fn)(spu_context*) = (*tr);
+            (*tr) = 0;
             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
             spu_hop(ctx, fn);
             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
@@ -582,7 +613,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                         /* iret fired deeper: registers restored, pc = srr0 */
                         ctx->host_depth = f.depth;
                         ctx->image_id = f.image_id;
-                        g_spu_trampoline_fn = spu_indirect_branch;
+                        (*tr) = spu_indirect_branch;
                         SPU_DRAIN_POP_IRQ();
                     }
                     continue;
@@ -604,7 +635,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
                             (unsigned)(return_pc & SPU_LS_MASK), pc, ctx->image_id, ctx->host_depth,
                             (int)ctx->resident_ovl); }
-                g_spu_trampoline_fn = spu_indirect_branch;
+                (*tr) = spu_indirect_branch;
                 continue;
             }
         }

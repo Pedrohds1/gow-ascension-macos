@@ -813,6 +813,75 @@ void cellGcm_request_tick(void)
     }
 }
 
+/* GCM_VBL_LAT=<s>: every s seconds, how long vblank ticks waited for their
+ * handler to be delivered (count, mean, max, histogram). Delivery happens in
+ * ppu_gcm_pump, which runs only when some guest thread reaches an HLE call or
+ * a timer sleep -- or on the GCM_VBL_THREAD thread below. */
+static int s_vbl_lat_s = -1;
+static volatile uint64_t s_vbl_tick_ns;           /* oldest undelivered tick, 0 = none */
+static uint64_t s_vl_n, s_vl_sum, s_vl_max, s_vl_t0;
+static unsigned s_vl_h[8];
+static void gcm_vbl_lat_tick(void)
+{
+    if (s_vbl_lat_s < 0) { const char* e = getenv("GCM_VBL_LAT"); s_vbl_lat_s = e ? atoi(e) : 0; }
+    if (s_vbl_lat_s > 0 && !s_vbl_tick_ns) s_vbl_tick_ns = ps3_ft_now();
+}
+static void gcm_vbl_lat_deliver(void)
+{
+    if (s_vbl_lat_s <= 0 || !s_vbl_tick_ns) return;
+    const uint64_t now = ps3_ft_now(), d = now - s_vbl_tick_ns;
+    s_vbl_tick_ns = 0;
+    s_vl_n++; s_vl_sum += d; if (d > s_vl_max) s_vl_max = d;
+    const unsigned b = d < 250000u ? 0 : d < 500000u ? 1 : d < 1000000u ? 2 : d < 2000000u ? 3 :
+                       d < 4000000u ? 4 : d < 8000000u ? 5 : d < 16000000u ? 6 : 7;
+    s_vl_h[b]++;
+    if (!s_vl_t0) s_vl_t0 = now;
+    if (now - s_vl_t0 >= (uint64_t)s_vbl_lat_s * 1000000000ull) {
+        fprintf(stderr, "[vbl-lat] %llu delivered, mean %.2f ms, max %.2f ms | <.25 %u <.5 %u <1 %u <2 %u <4 %u <8 %u <16 %u >=16 %u\n",
+                (unsigned long long)s_vl_n, s_vl_n ? s_vl_sum / 1e6 / (double)s_vl_n : 0.0, s_vl_max / 1e6,
+                s_vl_h[0], s_vl_h[1], s_vl_h[2], s_vl_h[3], s_vl_h[4], s_vl_h[5], s_vl_h[6], s_vl_h[7]);
+        s_vl_n = s_vl_sum = s_vl_max = 0; memset(s_vl_h, 0, sizeof s_vl_h); s_vl_t0 = now;
+    }
+}
+
+/* GCM_VBL_THREAD=1: deliver the vblank and flip handlers from a host thread of
+ * their own the moment the ticker marks them, as the PS3's interrupt thread
+ * does, instead of whenever a guest thread next reaches an HLE call or a timer
+ * sleep. GoW:A's vblank handler is what releases each frame's command segment
+ * to the RSX (it patches the segment's self-JUMP park), so a late delivery
+ * holds the walker back by that much. The handlers run on their own callback
+ * stack (ppu_guest_call_set_stack); ppu_gcm_pump still serializes every
+ * delivery with the ones guest threads make. */
+void ppu_gcm_pump(void);
+extern void ppu_guest_call_set_stack(uint32_t sp);
+static int s_vbl_thread = -1;
+static HANDLE s_vbl_ev;
+static DWORD WINAPI gcm_vbl_thread_proc(LPVOID p)
+{
+    (void)p;
+    ppu_guest_call_set_stack(0xCFFC0000u);   /* 128 KB below the shared 0xCFFE0000 */
+    for (;;) {
+        WaitForSingleObject(s_vbl_ev, 100);
+        ppu_gcm_pump();
+    }
+    return 0;
+}
+static void gcm_vbl_thread_kick(void)
+{
+    if (s_vbl_thread < 0) {
+        const char* e = getenv("GCM_VBL_THREAD");
+        s_vbl_thread = (e && atoi(e) > 0) ? 1 : 0;
+        if (s_vbl_thread) {
+            s_vbl_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+            if (!s_vbl_ev || !CreateThread(NULL, 16u << 20, gcm_vbl_thread_proc, NULL, 0, NULL))
+                s_vbl_thread = 0;
+            fprintf(stderr, "[gcm] vblank/flip handlers on their own thread (GCM_VBL_THREAD): %s\n",
+                    s_vbl_thread ? "on" : "FAILED");
+        }
+    }
+    if (s_vbl_thread > 0) SetEvent(s_vbl_ev);
+}
+
 /* Deliver pending handlers on the calling host thread. Serialize the entire
  * claim-and-deliver sequence across threads: an HLE boundary and a host ticker
  * may both pump, and newer causes must not overtake already claimed callbacks.
@@ -831,6 +900,7 @@ void ppu_gcm_pump(void)
                    fprintf(stderr, "[gcm-pump] calls=%u vblank=%u flip=%u vcount=%u%c",
                            calls, nv, nf, s_vblank_count, 10); } }
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
+        gcm_vbl_lat_deliver();
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
                            0, 0, 0, 0, 0, 0, 0);
@@ -862,7 +932,7 @@ void ppu_gcm_pump(void)
 
 /* Back-compat: the old direct entry points now just mark a tick pending (so any
  * caller other than the ticker still works) -- delivery stays on the main thread. */
-void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+void cellGcmTickVBlank(void) { s_vblank_count++; gcm_vbl_lat_tick(); GCM_PENDING_SET(1); gcm_vbl_thread_kick(); }
 /* Only deliver a flip completion when a flip is actually outstanding.
  *
  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
@@ -883,7 +953,7 @@ void cellGcmTickFlip(void)
     const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
-    if (waiting) GCM_PENDING_SET(2);
+    if (waiting) { GCM_PENDING_SET(2); gcm_vbl_thread_kick(); }
 }
 
 /* Drain the game's GCM FIFO into the RSX backend. Called from the present thread
@@ -2160,6 +2230,23 @@ void cellGcm_rsx_process_fifo(void)
 }
 
 /* GCM_GET_EQ_PUT=1: see where get is published at the end of a pass. */
+/* The lean per-word path of the FIFO walk (see its use): on unless GCM_FIFO_LEAN=0
+ * or a switch the full path reads per word is set. Read once. */
+static int s_fifo_lean = -1, s_lean_eng;
+static int gcm_fifo_lean(void)
+{
+    if (s_fifo_lean < 0) {
+        const char* e = getenv("GCM_FIFO_LEAN");
+        static const char* const diag[] = { "GCM_OBJDBG", "GCM_SUBCH_GATE", "GCM_VAL_WATCH", "GCM_METHOD_HIST",
+                                            "RSX_LIVE_FEED_DBG", "GCM_MARKERS", "GCM_EXEC_WATCH", "GCM_SUBCH7" };
+        int on = !(e && e[0] == '0') && !rsx_live_draw_enabled();
+        for (unsigned k = 0; on && k < sizeof diag / sizeof diag[0]; k++) if (getenv(diag[k])) on = 0;
+        s_lean_eng = rsx_draw_engine_enabled();
+        s_fifo_lean = on;
+    }
+    return s_fifo_lean;
+}
+
 static int gcm_get_eq_put(void)
 {
     static int eq = -1;
@@ -2423,6 +2510,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 /* Not past `queued`: a resync may already have written off
                  * this flip. */
                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+                /* CELL_GCM_DISPLAY_HSYNC (2) / HSYNC_WITH_NOISE (3): the RSX
+                 * flips at once instead of on the next vblank, so the flip is
+                 * complete when the drain executes it. Completing it only on the
+                 * 60 Hz ticker made a title that waits for its previous flip
+                 * (GoW:A's main thread at 0x375A78) wait up to a vblank more per
+                 * frame. Same thread as the ticker. GCM_FLIP_HSYNC_NOW=0 waits
+                 * for the ticker as before. */
+                { static int now = -1;
+                  if (now < 0) { const char* e = getenv("GCM_FLIP_HSYNC_NOW"); now = !(e && *e == '0'); }
+                  if (now && (s_flip_mode == 2u || s_flip_mode == 3u)) cellGcmTickFlip(); }
             } else {
                 cellGcmSetFlipCommand(w & 0xFFu);
             }
@@ -2665,6 +2762,22 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                 if (!dea) break;
                 u32 m = (type == 0) ? method + i * 4 : method;
+                /* Lean path for the common word: an NV4097 method on subchannel 0
+                 * with every per-word diagnostic below switched off. It does what
+                 * the full path does for such a word -- the draw engine, the
+                 * legacy decoder's few methods, the reference queue -- without the
+                 * dozen per-word switch tests on the way (~180k words a frame in
+                 * GoW:A). The two report methods (0x1A8, 0x1800) keep the full
+                 * path. GCM_FIFO_LEAN=0 turns it off. */
+                if (subch == 0 && m != 0x1A8u && m != 0x1800u && gcm_fifo_lean()) {
+                    const u32 v = vm_read32(dea);
+                    if (s_lean_eng) rsx_draw_engine_method(m, v);
+                    if (!legacy_skip || m == 0x50u || m == 0x104u || m == 0x180u || m == 0x1A4u ||
+                        (m >= 0x1D6Cu && m <= 0x1D74u))
+                        rsx_process_method(&s_state, m, v);
+                    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+                    continue;
+                }
                 /* GCM_SET_USER_COMMAND is method 0xEB00, which this decode
                  * splits into subchannel 7 / method 0x0B00 -- so it was landing
                  * in the 2D engine path and being dropped as unrecognised. It

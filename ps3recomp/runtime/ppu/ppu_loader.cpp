@@ -926,6 +926,10 @@ extern "C" void ppu_log_host_chain(const char* tag);  /* fwd decl (defined below
 extern "C" int  spu_coh_is_reserved(uint32_t addr);
 extern "C" void spu_lockline_lock(void);
 extern "C" void spu_lockline_unlock(void);
+extern "C" void spu_lockline_lock_line(uint32_t ea);     /* one line's stripe */
+extern "C" void spu_lockline_unlock_line(uint32_t ea);
+extern "C" void spu_lockline_lock_span(uint32_t ea, uint32_t size);
+extern "C" void spu_lockline_unlock_span(uint32_t ea, uint32_t size);
 extern "C" void spu_coh_notify_write(uint32_t addr);
 
 /* ---------------------------------------------------------------------------
@@ -1125,18 +1129,18 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
             if ((++n % 100000) == 1)
                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
                         n, (uint32_t)ea & ~127u); } }
-    if (coh) spu_lockline_lock();
+    if (coh) spu_lockline_lock_line((uint32_t)ea);
     /* Re-check under the lock-line lock: an SPU commit to this line between
      * the check above and here has broken the reservation (SPU commits call
      * ppu_resv_break_line with this lock held). */
     if (coh && self && self->reserve_addr != (uint32_t)ea) {
-        spu_lockline_unlock(); resv_unlock(L); return 0;
+        spu_lockline_unlock_line((uint32_t)ea); resv_unlock(L); return 0;
     }
     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
+        spu_lockline_unlock_line((uint32_t)ea);
     }
     if (ok) ppu_resv_break(ea);
     resv_unlock(L);
@@ -1202,14 +1206,14 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
     resv_lock(L);
     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
     int coh = spu_coh_is_reserved((uint32_t)ea);
-    if (coh) spu_lockline_lock();
+    if (coh) spu_lockline_lock_line((uint32_t)ea);
     if (coh && self && self->reserve_addr != (uint32_t)ea) {   /* as in ppu_stwcx32 */
-        spu_lockline_unlock(); resv_unlock(L); return 0;
+        spu_lockline_unlock_line((uint32_t)ea); resv_unlock(L); return 0;
     }
     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
     if (coh) {
         if (ok) spu_coh_notify_write((uint32_t)ea);
-        spu_lockline_unlock();
+        spu_lockline_unlock_line((uint32_t)ea);
     }
     if (ok) { ppu_resv_break(ea); ppu_resv_break(ea + 4); }  /* 8-byte store spans two words */
     resv_unlock(L);
@@ -1799,10 +1803,10 @@ extern "C" int* ps3_ppu_vcall_sp_slot(void) { return &g_vcall_sp; }
 #define VM_WRITE_COH(a, src, n)                                               \
     do {                                                                      \
         if (spu_coh_line_reserved((uint32_t)(a))) {                           \
-            spu_lockline_lock();                                              \
+            spu_lockline_lock_span((uint32_t)(a), (uint32_t)(n));             \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
             spu_coh_notify_write((uint32_t)(a));                              \
-            spu_lockline_unlock();                                            \
+            spu_lockline_unlock_span((uint32_t)(a), (uint32_t)(n));           \
         } else {                                                              \
             memcpy(vm_base + (uint32_t)(a), (src), (n));                      \
         }                                                                     \
@@ -4247,6 +4251,12 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
 }
 
+/* The callback scratch stack of the calling host thread: 0xCFFE0000 unless the
+ * thread set its own. A host thread that delivers callbacks concurrently with
+ * the guest threads (cellGcmSys.c GCM_VBL_THREAD) needs one nobody else uses. */
+static PPU_THREAD_LOCAL uint32_t t_cb_sp = 0;
+extern "C" void ppu_guest_call_set_stack(uint32_t sp) { t_cb_sp = sp; }
+
 extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
@@ -4273,8 +4283,8 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
 
     /* Private scratch stack high in the guest stack region, distinct from the
      * main + ppu_thread stacks. One callback at a time per caller thread. */
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!t_cb_sp) t_cb_sp = 0xCFFE0000u;
+    const uint32_t s_cb_sp = t_cb_sp;
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -4318,8 +4328,8 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
     ppu_fn fn = ppu_lookup(code);
     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
 
-    static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
+    if (!t_cb_sp) t_cb_sp = 0xCFFE0000u;
+    const uint32_t s_cb_sp = t_cb_sp;
 
     ppu_context ctx;
     memset(&ctx, 0, sizeof(ctx));

@@ -109,9 +109,11 @@ typedef struct ppu_context {
     uint32_t vscr;      /* Vector status/control reg   */
     uint64_t cia;       /* Current instruction address */
     uint64_t thread_id;     /* PPU thread ID              */
+    char     resv_pad0[128];  /* reserve_* on a cache line of their own (runtime/ppu/ppu_context.h) */
     uint64_t reserve_addr;  /* lwarx/stwcx. reservation address */
     uint64_t reserve_value; /* lwarx/stwcx. reservation value   */
     int      reserve_valid; /* lwarx/stwcx. reservation flag    */
+    char     resv_pad1[128];
     uint32_t vrsave;        /* VRSAVE (SPR 256): plain state      */
 } ppu_context;
 

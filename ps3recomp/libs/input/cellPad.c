@@ -805,6 +805,35 @@ skip_inject: ;
               data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= (u16)((held_mask >> 8) & 0xFF); }
       } }
 
+    /* PAD_STICK_FILE=<path> -- closed-loop sticks, the PAD_FILE of the analog
+     * axes. The file holds "lx ly rx ry" (0-255, 128 = centred); it is re-read
+     * every 16 polls and the last values are held, so a driver outside the
+     * process can walk the character step by step from the frame dumps:
+     *   echo "128 0 128 128" > stick.txt   # left stick up (forward)
+     *   echo "128 128 128 128" > stick.txt # stop */
+    { static int s_sf = -1; static char sf_path[512]; static int sf_tick = 0;
+      static int sf_v[4] = {128, 128, 128, 128}; static int sf_have = 0;
+      if (s_sf < 0) { const char* e = getenv("PAD_STICK_FILE");
+                      s_sf = (e && *e) ? 1 : 0;
+                      if (s_sf) { strncpy(sf_path, e, sizeof sf_path - 1); sf_path[sizeof sf_path - 1] = 0; } }
+      if (s_sf && port_no == 0) {
+          if ((sf_tick++ & 15) == 0) {
+              FILE* f = fopen(sf_path, "rb");
+              if (f) {
+                  int a, b, c, d;
+                  if (fscanf(f, "%d %d %d %d", &a, &b, &c, &d) == 4) {
+                      if (a != sf_v[0] || b != sf_v[1] || c != sf_v[2] || d != sf_v[3]) {
+                          printf("[cellPad] PAD_STICK_FILE %d %d %d %d\n", a, b, c, d); fflush(stdout); }
+                      sf_v[0] = a; sf_v[1] = b; sf_v[2] = c; sf_v[3] = d; sf_have = 1;
+                  }
+                  fclose(f);
+              }
+          }
+          if (sf_have) { hs->analog_lx = (u8)sf_v[0]; hs->analog_ly = (u8)sf_v[1];
+                         hs->analog_rx = (u8)sf_v[2]; hs->analog_ry = (u8)sf_v[3];
+                         hs->connected = 1; }
+      } }
+
     /* Analog sticks */
     /* PAD_STICK="lx,ly,rx,ry" (0-255, 128 = centred): hold the analog sticks at
      * fixed positions. Rubber Ducky drives its camera from the sticks and never

@@ -50,6 +50,38 @@ Vulkan/MoltenVK or Metal.
 - **No gain on the M4** (dropped): SPU register promotion (context round-trips are cheap in L1),
   `-O3`, raising thread QoS.
 
+## Reaching ~60 fps in the Megaera fight
+
+~41 → ~60 fps over two days (A/B 59.9; steady part 61.1; 10-minute run 59.7).
+
+- **Measure the right phase.** The old benchmark window included a light transition (65–83 fps)
+  whose end moves with loading speed, so changes that only sped up loading looked like gains.
+  Measure a fixed window of the fight and look at the frames.
+- **Give threads only to what the main thread waits on.** The game registers every SPURS
+  workload with a contention of one SPU. Extra lanes for the job lists the main thread waits on
+  took the fight from 43.7 to 50.8 fps; lanes for the other lists did nothing or worse.
+- **No GPU waits inside a frame.** Texture creation waited for a submit just for a layout
+  transition, and every release waited for all batches in flight.
+- **Profile a lock per line before striping it.** The SPU lock-line lock was the hottest function
+  once the lanes were up. Most of its traffic was on different lines, so striping by line paid
+  off (+2.3 fps).
+- **On ARM, a load-acquire per entry serializes a scan.** Read relaxed after the seq_cst fence
+  and acquire only on a match.
+- **A field other threads read must not share a cache line with fields its owner writes all the
+  time** (the PPU `reserve_addr` next to cr/xer/lr).
+- **An interpreter hot spot outside a module's image is runtime-loaded code.** Find where it
+  came from before touching the lifter. A local-store dump at the first miss, compared with the
+  executable, showed a relocatable blob that was already translated, at a second placement the
+  runtime did not know. Recognizing blobs by content took ~2 s of every 20 s out of the
+  interpreter.
+- **Mach-O thread-locals are calls** (`_tlv_get_addr`). Cache the address in a per-thread
+  context and check it against the stack range.
+- **Dropped, measured:** handing the SPU back to EDGE when it has priority (`SPURS_POLL_SELECT`,
+  56 → 34 fps), an 8 ms vblank (the gain was in the transition, not the fight), MoltenVK's
+  asynchronous submits, a vblank delivery thread.
+- Still open: ~14% of the frames run past 20 ms. They are bound by the EDGE geometry jobs, which
+  the game confines to four SPUs.
+
 ## Shader stutter (pipelines)
 
 The first time each shader and state combination appeared, the frame paid the whole host compile:
